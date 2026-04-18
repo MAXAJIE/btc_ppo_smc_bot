@@ -37,6 +37,8 @@ from ..features.multi_tf_features import build_observation, OBS_DIM
 from ..features.garch_kelly import GarchKellyEstimator, kelly_position_size
 from ..utils.reward import compute_step_reward, cost_penalty, funding_cost, killswitch_penalty
 from ..utils.websocket_feed import WebSocketCandleFeed, RESTCandleFeed
+from src.utils.logger import TradeLogger
+
 
 logger = logging.getLogger(__name__)
 
