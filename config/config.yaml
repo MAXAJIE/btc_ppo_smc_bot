@@ -1,0 +1,123 @@
+# ═══════════════════════════════════════════════════════════════════
+#  BTC PPO SMC Trading Bot — Master Config
+# ═══════════════════════════════════════════════════════════════════
+
+# ── Trading Pair & Market ─────────────────────────────────────────
+symbol: "BTCUSDT"
+market_type: "futures"          # futures (USDT perpetual)
+margin_mode: "isolated"
+max_leverage: 3                 # hard cap, Kelly will usually go lower
+
+# ── Timeframes ────────────────────────────────────────────────────
+timeframes:
+  entry: "5m"                   # agent acts on 5m closes
+  confirmation: ["15m", "1h"]   # signal confirmation
+  trend_filter: ["4h", "1d"]    # macro trend gate
+
+# ── Episode ───────────────────────────────────────────────────────
+episode:
+  candles_per_episode: 4320     # 15 days × 288 5m candles/day
+  warmup_candles: 500           # candles before episode start (for indicators)
+  max_bars_in_trade: 576        # force-close after 2 days (576 × 5m)
+
+# ── Observation Space ─────────────────────────────────────────────
+obs:
+  dim: 90                       # total feature vector length
+  normalize: true
+  clip_range: 5.0               # clip normalized features to [-5, 5]
+
+# ── Action Space ─────────────────────────────────────────────────
+# Discrete(7):
+#   0=HOLD  1=LONG_FULL  2=LONG_HALF  3=SHORT_FULL  4=SHORT_HALF  5=CLOSE  6=REDUCE_50
+actions:
+  n_actions: 7
+  long_full_size: 1.0           # fraction of Kelly-recommended size
+  long_half_size: 0.5
+  short_full_size: 1.0
+  short_half_size: 0.5
+  reduce_pct: 0.5
+
+# ── Reward ────────────────────────────────────────────────────────
+reward:
+  win_scale: 1.0                # multiplier on log(1 + pnl)
+  loss_penalty: 2.0             # amplified punishment multiplier
+  step_hold_penalty: -0.0001    # per-step time decay when flat
+  commission_rate: 0.0004       # 0.04% taker fee (futures)
+  slippage_rate: 0.0002         # estimated market impact
+  funding_rate_interval: 480    # every 8h = 480 5m candles
+
+# ── Risk Management ───────────────────────────────────────────────
+risk:
+  max_drawdown_kill: 0.15       # kill-switch: halt at -15% drawdown
+  initial_balance: 5000.0      # USDT (testnet)
+  kelly_fraction: 0.25          # fractional Kelly (quarter Kelly)
+  min_kelly_size: 0.01          # minimum position size fraction
+  max_kelly_size: 1.0           # maximum position size fraction
+  stop_loss_pct: 0.03           # 3% SL per trade (hard stop)
+  take_profit_pct: 0.06         # 6% TP per trade (optional, agent can close earlier)
+
+# ── Feature Engineering ───────────────────────────────────────────
+features:
+  smc:
+    swing_length: 50            # bars for swing H/L detection
+    ob_mitigation: false        # include mitigated OBs
+    fvg_join_consecutive: false
+  snr:
+    pivot_left: 10
+    pivot_right: 10
+    n_levels: 3                 # top N S/R levels per side
+  garch:
+    returns_window: 200         # rolling window for GARCH fit
+    p: 1
+    q: 1
+    vol_regime_thresholds: [0.01, 0.025]  # low/med/high vol boundaries
+  amt:
+    profile_window_candles: 288  # 1 day of 5m candles for volume profile
+    n_bins: 100
+    value_area_pct: 0.70        # 70% of volume defines value area
+
+# ── PPO Hyperparameters ───────────────────────────────────────────
+ppo:
+  policy: "MlpPolicy"
+  learning_rate: 0.0003
+  n_steps: 2048                 # rollout buffer size per env
+  batch_size: 256
+  n_epochs: 10
+  gamma: 0.995                  # high discount — long episode
+  gae_lambda: 0.95
+  clip_range: 0.2
+  clip_range_vf: null
+  ent_coef: 0.01                # exploration
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  policy_kwargs:
+    net_arch: [256, 256, 128]   # actor + critic shared layers
+    activation_fn: "tanh"
+
+# ── Offline Training (main_train.py) ─────────────────────────────
+offline:
+  total_timesteps: 3000000      # ~694 episodes
+  historical_years: 2           # years of data to download
+  save_every: 100000            # checkpoint frequency
+  tb_log_dir: "./logs/tensorboard"
+  eval_episodes: 10
+
+# ── Live Testnet Training (main_live.py) ──────────────────────────
+live:
+  continue_training: true
+  update_every_episodes: 1      # PPO update after each episode
+  walk_forward_days: 7          # re-validate every 7 days
+  max_runtime_hours: 168        # 7 days continuous
+
+# ── Modal ─────────────────────────────────────────────────────────
+modal:
+  gpu: "A10G"                   # A10G = good cost/perf for RL (not LLM)
+  timeout_hours: 23             # Modal max timeout ~24h; restart externally
+  volume_name: "btc-ppo-vol"
+  secret_name: "binance-secrets"
+  image_python: "3.11"
+
+# ── Lightning.ai ─────────────────────────────────────────────────
+lightning:
+  machine: "h100"  # or "cpu" for debugging
+  studio_name: "btc-ppo-trainer"
