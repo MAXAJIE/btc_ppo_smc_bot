@@ -41,15 +41,25 @@ actions:
 reward:
   win_scale: 1.0                # multiplier on log(1 + pnl)
   loss_penalty: 2.0             # amplified punishment multiplier
-  step_hold_penalty: -0.0001    # per-step time decay when flat
+  step_hold_penalty: -0.0001    # per-step time decay when FLAT (no position)
   commission_rate: 0.0004       # 0.04% taker fee (futures)
   slippage_rate: 0.0002         # estimated market impact
   funding_rate_interval: 480    # every 8h = 480 5m candles
 
+  # ── A. Punitive kill-switch reward ───────────────────────────────
+  # When kill-switch fires: R = -kill_penalty_scale * (1 + drawdown)
+  # e.g. 30% DD → R = -50 * 1.30 = -65
+  kill_penalty_scale: 50.0
+
+  # ── B. Holding cost (time-in-trade penalty) ───────────────────────
+  # Deducted every 5m bar while a position is OPEN.
+  # -0.0005/bar = -0.144/day. Punishes dead-hold survival tactics.
+  holding_cost_per_bar: -0.0005
+
 # ── Risk Management ───────────────────────────────────────────────
 risk:
   max_drawdown_kill: 0.15       # kill-switch: halt at -15% drawdown
-  initial_balance: 5000.0      # USDT (testnet)
+  initial_balance: 10000.0      # USDT (testnet)
   kelly_fraction: 0.25          # fractional Kelly (quarter Kelly)
   min_kelly_size: 0.01          # minimum position size fraction
   max_kelly_size: 1.0           # maximum position size fraction
@@ -76,11 +86,17 @@ features:
     n_bins: 100
     value_area_pct: 0.70        # 70% of volume defines value area
 
+  # ── C. Stationarity / normalisation windows ───────────────────────
+  stationarity:
+    volume_zscore_window: 50    # bars for rolling volume z-score
+    ema_velocity_window: 5      # bars for EMA-distance velocity (d/dt)
+    rolling_std_min: 1e-8       # floor to avoid div-by-zero
+
 # ── PPO Hyperparameters ───────────────────────────────────────────
 ppo:
   policy: "MlpPolicy"
   learning_rate: 0.0003
-  n_steps: 2048                 # rollout buffer size per environment
+  n_steps: 2048                 # rollout buffer size per env
   batch_size: 256
   n_epochs: 10
   gamma: 0.995                  # high discount — long episode
@@ -119,5 +135,5 @@ modal:
 
 # ── Lightning.ai ─────────────────────────────────────────────────
 lightning:
-  machine: "h100"  # or "cpu" for debugging
+  machine: "gpu-rtx-4090-x-1"  # or "cpu" for debugging
   studio_name: "btc-ppo-trainer"

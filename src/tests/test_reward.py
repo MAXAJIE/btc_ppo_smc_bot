@@ -264,3 +264,135 @@ class TestComputeStepReward:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [A] killswitch_penalty
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestKillswitchPenalty:
+
+    def test_always_negative(self):
+        from src.utils.reward import killswitch_penalty
+        for dd in [0.10, 0.15, 0.20, 0.30, 0.50]:
+            r = killswitch_penalty(dd)
+            assert r < 0, f"Expected negative at dd={dd}, got {r}"
+
+    def test_proportional_to_drawdown(self):
+        from src.utils.reward import killswitch_penalty
+        r_low  = killswitch_penalty(0.15)
+        r_high = killswitch_penalty(0.30)
+        assert r_high < r_low, "Higher drawdown should produce larger penalty"
+
+    def test_formula_exact(self):
+        """R = -scale * (1 + drawdown)"""
+        from src.utils.reward import killswitch_penalty
+        scale = 50.0
+        dd    = 0.30
+        expected = -scale * (1.0 + dd)   # -65.0
+        result   = killswitch_penalty(dd, scale=scale)
+        assert result == pytest.approx(expected, rel=1e-6), f"Expected {expected}, got {result}"
+
+    def test_magnitude_dominates_trade_reward(self):
+        """Penalty should be >> any normal trade reward."""
+        from src.utils.reward import killswitch_penalty, trade_reward
+        best_trade = trade_reward(pnl_pct=0.10)   # +10% win, huge
+        penalty    = killswitch_penalty(0.15)
+        assert abs(penalty) > abs(best_trade) * 5, (
+            f"Kill penalty |{penalty:.2f}| should dominate best trade |{best_trade:.2f}|"
+        )
+
+    def test_custom_scale(self):
+        from src.utils.reward import killswitch_penalty
+        r1 = killswitch_penalty(0.20, scale=50.0)
+        r2 = killswitch_penalty(0.20, scale=100.0)
+        assert abs(r2) == pytest.approx(abs(r1) * 2, rel=1e-5)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [B] holding_cost
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestHoldingCost:
+
+    def test_zero_when_flat(self):
+        from src.utils.reward import holding_cost
+        assert holding_cost(bars_in_trade=0, position=0) == 0.0
+        assert holding_cost(bars_in_trade=50, position=0) == 0.0
+
+    def test_negative_when_in_trade(self):
+        from src.utils.reward import holding_cost
+        r = holding_cost(bars_in_trade=1, position=1)
+        assert r < 0
+        r = holding_cost(bars_in_trade=1, position=-1)
+        assert r < 0
+
+    def test_flat_per_bar(self):
+        """Cost should be the same per bar regardless of bars_in_trade (flat, not cumulative)."""
+        from src.utils.reward import holding_cost
+        r1 = holding_cost(1,   position=1)
+        r2 = holding_cost(100, position=1)
+        r3 = holding_cost(500, position=1)
+        assert r1 == pytest.approx(r2, rel=1e-6), "Holding cost should be flat per bar"
+        assert r1 == pytest.approx(r3, rel=1e-6)
+
+    def test_custom_cost(self):
+        from src.utils.reward import holding_cost
+        r = holding_cost(1, 1, cost_per_bar=-0.001)
+        assert r == pytest.approx(-0.001, rel=1e-6)
+
+    def test_small_enough_not_to_dominate(self):
+        """576 bars (2 days) of holding cost should be < 1 typical trade reward."""
+        from src.utils.reward import holding_cost, trade_reward
+        total_holding_cost = sum(holding_cost(i, 1) for i in range(576))
+        typical_trade = trade_reward(0.02)  # +2% win
+        assert abs(total_holding_cost) < abs(typical_trade) * 5, (
+            f"2-day holding cost {total_holding_cost:.3f} should be < 5x typical trade {typical_trade:.3f}"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [A] compute_step_reward with kill_triggered
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestKillTriggeredInComposite:
+
+    def _base(self, **kw):
+        defaults = dict(
+            position=0, unrealized_pnl_pct=0.0, bars_in_trade=0,
+            current_drawdown=0.0, trade_closed=False, realized_pnl_pct=0.0,
+            transaction_cost=0.0, funding_fee=0.0,
+        )
+        defaults.update(kw)
+        return defaults
+
+    def test_kill_triggered_dominates_everything(self):
+        r_kill = compute_step_reward(**self._base(
+            kill_triggered=True,
+            current_drawdown=0.30,
+            trade_closed=True,
+            realized_pnl_pct=0.05,   # even a winning trade
+        ))
+        r_normal = compute_step_reward(**self._base(
+            trade_closed=True,
+            realized_pnl_pct=-0.10,  # even a 10% losing trade
+        ))
+        assert r_kill < r_normal, (
+            f"Kill-triggered reward {r_kill:.2f} should be worse than worst trade {r_normal:.2f}"
+        )
+
+    def test_kill_not_triggered_behaves_normally(self):
+        r = compute_step_reward(**self._base(
+            kill_triggered=False,
+            trade_closed=True,
+            realized_pnl_pct=0.02,
+        ))
+        assert r > 0
+
+    def test_holding_cost_deducted_when_in_trade(self):
+        r_in  = compute_step_reward(**self._base(position=1,  unrealized_pnl_pct=0.0))
+        r_out = compute_step_reward(**self._base(position=0,  unrealized_pnl_pct=0.0))
+        # In-trade should be worse than flat (holding cost applied)
+        assert r_in < r_out, (
+            f"In-trade reward {r_in:.5f} should be lower than flat {r_out:.5f} due to holding cost"
+        )

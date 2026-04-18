@@ -6,35 +6,30 @@ Aggregates all feature modules into the 90-dimensional observation vector.
 Observation layout (90 dims total)
 ────────────────────────────────────
 [00:15]  OHLCV momentum — 5m   (15)
-[15:30]  OHLCV momentum — 15m  (15)
-[30:45]  OHLCV momentum — 1h   (15)
-[45:55]  OHLCV momentum — 4h   (10)
-[55:65]  OHLCV momentum — 1D   (10)
-[65:73]  SMC features — 5m      (8)
-[73:81]  SMC features — 1h      (8)
-[81:87]  SNR features — 1h      (6)
-[87:93]  AMT features — 4h      (6)
-[93:97]  GARCH + Kelly           (4)
-[97:90]  ← WAIT — recounted below
-
-Actual final count:
-  15 + 15 + 15 + 10 + 10 + 8 + 8 + 6 + 6 + 4 + 6 (position) = 103
-
-We compress to 90 by using 10 instead of 15 for 15m and 1h.
-Final layout:
-[00:15]  OHLCV 5m    (15)
-[15:25]  OHLCV 15m   (10)
-[25:35]  OHLCV 1h    (10)
-[35:43]  OHLCV 4h    (8)
-[43:51]  OHLCV 1D    (8)
-[51:59]  SMC 5m      (8)
-[59:67]  SMC 1h      (8)
-[67:73]  SNR 1h      (6)
-[73:79]  AMT 4h      (6)
-[79:83]  GARCH+Kelly (4)
-[83:90]  Position    (7)
+[15:25]  OHLCV momentum — 15m  (10)
+[25:35]  OHLCV momentum — 1h   (10)
+[35:43]  OHLCV momentum — 4h   (8)
+[43:51]  OHLCV momentum — 1D   (8)
+[51:59]  SMC features  — 5m    (8)
+[59:67]  SMC features  — 1h    (8)
+[67:73]  SNR levels    — 1h    (6)
+[73:79]  AMT/Vol Prof  — 4h    (6)
+[79:83]  GARCH+Kelly           (4)
+[83:90]  Position state        (7)
          ─────────────
          Total: 90 ✓
+
+Stationarity guarantees  [C]
+─────────────────────────────
+Every feature entering the observation vector is either:
+  1. A log-return (first difference of log-price)      → I(0) by construction
+  2. A ratio relative to a rolling window              → approximately I(0)
+  3. A z-score normalised with a rolling window mean+std → zero-mean, unit-var
+  4. A bounded ratio (wick/body/range) in [0,1] or [-1,1] → already stationary
+  5. A distance to a level, expressed as % of price    → approximately I(0)
+
+Non-stationary inputs (raw price levels, raw volumes) are NEVER passed to
+the policy network.  This is enforced in _ohlcv_features() below.
 """
 
 import numpy as np
@@ -48,7 +43,7 @@ from .garch_kelly import GarchKellyEstimator
 
 OBS_DIM = 90
 
-# Singleton estimator (avoid re-creating arch model objects)
+# Singleton GARCH estimator (avoid re-creating arch model objects every step)
 _GARCH_EST = None
 
 
@@ -74,49 +69,35 @@ def build_observation(
     """
     Build the 90-dim observation vector for the PPO agent.
 
-    Parameters
-    ----------
-    candles : dict
-        Keys: '5m', '15m', '1h', '4h', '1d'
-        Values: pd.DataFrame with OHLCV columns (up to current bar, no lookahead)
-    position : int
-        -1 = short, 0 = flat, 1 = long
-    unrealized_pnl_pct : float
-        Open trade P&L as fraction of entry notional
-    leverage_used : float
-        Current leverage (0 if flat)
-    bars_in_trade : int
-        Number of 5m bars since trade opened
-    account_drawdown : float
-        Current drawdown from equity peak [0, 1]
-    kelly_adj : float
-        Latest Kelly-adjusted position size fraction
-    bars_since_last_trade : int
-        5m bars since last closed trade (to detect stagnation)
+    All features are stationary — see module docstring for guarantees.
     """
     obs = np.zeros(OBS_DIM, dtype=np.float32)
 
-    df_5m = candles.get("5m")
+    df_5m  = candles.get("5m")
     df_15m = candles.get("15m")
-    df_1h = candles.get("1h")
-    df_4h = candles.get("4h")
-    df_1d = candles.get("1d")
+    df_1h  = candles.get("1h")
+    df_4h  = candles.get("4h")
+    df_1d  = candles.get("1d")
 
-    cur_price = float(df_5m["close"].iloc[-1]) if df_5m is not None and len(df_5m) > 0 else 1.0
+    cur_price = (
+        float(df_5m["close"].iloc[-1])
+        if df_5m is not None and len(df_5m) > 0
+        else 1.0
+    )
 
-    # ── [00:15] OHLCV 5m (15 features) ──────────────────────────────
-    obs[0:15] = _ohlcv_features(df_5m, n=15)
+    # ── [00:15] OHLCV 5m (15 stationary features) ────────────────────
+    obs[0:15]  = _ohlcv_features(df_5m, n=15)
 
-    # ── [15:25] OHLCV 15m (10 features) ─────────────────────────────
+    # ── [15:25] OHLCV 15m (10 stationary features) ───────────────────
     obs[15:25] = _ohlcv_features(df_15m, n=10)
 
-    # ── [25:35] OHLCV 1h (10 features) ──────────────────────────────
+    # ── [25:35] OHLCV 1h (10 stationary features) ────────────────────
     obs[25:35] = _ohlcv_features(df_1h, n=10)
 
-    # ── [35:43] OHLCV 4h (8 features) ───────────────────────────────
+    # ── [35:43] OHLCV 4h (8 stationary features) ─────────────────────
     obs[35:43] = _ohlcv_features(df_4h, n=8)
 
-    # ── [43:51] OHLCV 1D (8 features) ───────────────────────────────
+    # ── [43:51] OHLCV 1D (8 stationary features) ─────────────────────
     obs[43:51] = _ohlcv_features(df_1d, n=8)
 
     # ── [51:59] SMC 5m ───────────────────────────────────────────────
@@ -140,130 +121,130 @@ def build_observation(
         obs[81] = float(gk["kelly_fraction"])
         obs[82] = float(gk["kelly_adj"])
 
-    # ── [83:90] Position State (7 features) ──────────────────────────
-    obs[83] = float(position)                                          # -1/0/1
-    obs[84] = float(np.clip(unrealized_pnl_pct * 100, -5, 5))        # scaled PnL
-    obs[85] = float(np.clip(leverage_used / 3.0, 0, 1))               # normalised leverage
-    obs[86] = float(np.clip(bars_in_trade / 576.0, 0, 1))             # normalised duration
-    obs[87] = float(np.clip(account_drawdown * 10.0, 0, 1))           # amplified drawdown
+    # ── [83:90] Position state (7 features) ──────────────────────────
+    obs[83] = float(position)
+    obs[84] = float(np.clip(unrealized_pnl_pct * 100, -5, 5))
+    obs[85] = float(np.clip(leverage_used / 3.0, 0, 1))
+    obs[86] = float(np.clip(bars_in_trade / 576.0, 0, 1))
+    obs[87] = float(np.clip(account_drawdown * 10.0, 0, 1))
     obs[88] = float(np.clip(kelly_adj, 0, 1))
-    obs[89] = float(np.clip(bars_since_last_trade / 288.0, 0, 1))     # 1 day normalised
+    obs[89] = float(np.clip(bars_since_last_trade / 288.0, 0, 1))
 
-    # Final clip to prevent any outliers reaching the policy network
+    # Hard clip — no outlier escapes to the policy network
     obs = np.clip(obs, -5.0, 5.0)
-
     return obs
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# OHLCV feature extractor
+# OHLCV feature extractor — stationarity enforced at each feature
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _ohlcv_features(df: pd.DataFrame, n: int) -> np.ndarray:
     """
-    Extract `n` momentum/structure features from an OHLCV DataFrame.
+    Extract `n` stationary features from an OHLCV DataFrame.
 
-    Always returns np.ndarray of shape (n,).
-    Feature set (n=15 shown, truncated to n if n < 15):
-      [0]  log return (1 bar)
-      [1]  log return (3 bars)
-      [2]  log return (6 bars)
-      [3]  log return (12 bars)
-      [4]  log return (24 bars)
-      [5]  normalised volume (vs 20-bar avg)
-      [6]  high-low range / close (volatility proxy)
-      [7]  close position within bar's range
-      [8]  EMA8 distance
-      [9]  EMA21 distance
-      [10] RSI-like momentum (14 bar)
-      [11] volume trend (slope)
-      [12] body ratio (close-open / high-low)
-      [13] upper wick ratio
-      [14] lower wick ratio
+    Feature set (n=15 shown; truncated/padded to n as needed):
+    ─────────────────────────────────────────────────────────
+    [0]  log-return 1 bar           — I(0) by definition
+    [1]  log-return 3 bars          — I(0)
+    [2]  log-return 6 bars          — I(0)
+    [3]  log-return 12 bars         — I(0)
+    [4]  log-return 24 bars         — I(0)
+    [5]  volume z-score (50-bar)    — [C] z-scored → zero-mean, stable σ
+    [6]  high-low range / close     — price-normalised ratio → stationary
+    [7]  close position in bar      — bounded [−1, 1] → stationary
+    [8]  EMA8 distance z-score      — [C] z-scored 20-bar rolling window
+    [9]  EMA21 distance z-score     — [C] z-scored 30-bar rolling window
+    [10] RSI (0-centred, /50)       — bounded, stationary
+    [11] EMA8 distance velocity     — [C] 1-bar Δ(EMA8_dist) → stationary
+    [12] body ratio                 — bounded [0, 1] → stationary
+    [13] upper wick ratio           — bounded [0, 1] → stationary
+    [14] lower wick ratio           — bounded [0, 1] → stationary
+
+    All clipped to [−1, 1] before returning.
     """
     if df is None or len(df) < 5:
         return np.zeros(n, dtype=np.float32)
 
     try:
-        closes = df["close"].values.astype(np.float64)
-        highs = df["high"].values.astype(np.float64)
-        lows = df["low"].values.astype(np.float64)
-        opens = df["open"].values.astype(np.float64)
+        closes  = df["close"].values.astype(np.float64)
+        highs   = df["high"].values.astype(np.float64)
+        lows    = df["low"].values.astype(np.float64)
+        opens   = df["open"].values.astype(np.float64)
         volumes = df["volume"].values.astype(np.float64)
 
         features = []
 
-        # Log returns at different horizons
+        # ── [0-4] Log-returns at 5 horizons — inherently I(0) ────────
         for lag in [1, 3, 6, 12, 24]:
             if len(closes) > lag:
                 r = float(np.log(closes[-1] / closes[-lag - 1]))
-                features.append(np.clip(r * 20, -1, 1))  # 5% move → 1.0
+                features.append(float(np.clip(r * 20.0, -1.0, 1.0)))  # 5% → 1.0
             else:
                 features.append(0.0)
 
-        # Normalised volume
-        if len(volumes) >= 20:
-            vol_avg = np.mean(volumes[-20:])
-            features.append(float(np.clip(volumes[-1] / (vol_avg + 1e-10) - 1, -2, 2)))
-        else:
-            features.append(0.0)
+        # ── [5] Volume z-score (50-bar rolling) ───────────────────────
+        # Raw volume is non-stationary (grows with market cap).
+        # z-score relative to a 50-bar rolling window is stationary.
+        features.append(_zscore_last(volumes, window=50))
 
-        # High-low range
+        # ── [6] High-low range / close — price-normalised ─────────────
         hl_range = (highs[-1] - lows[-1]) / (closes[-1] + 1e-10)
-        features.append(float(np.clip(hl_range * 20, 0, 1)))
+        features.append(float(np.clip(hl_range * 20.0, 0.0, 1.0)))
 
-        # Close position within bar
+        # ── [7] Close position within bar ─────────────────────────────
         bar_range = highs[-1] - lows[-1]
-        if bar_range > 0:
-            cp = (closes[-1] - lows[-1]) / bar_range
-        else:
-            cp = 0.5
-        features.append(float(np.clip(cp * 2 - 1, -1, 1)))  # [-1, 1]
+        cp = (closes[-1] - lows[-1]) / bar_range if bar_range > 0 else 0.5
+        features.append(float(np.clip(cp * 2.0 - 1.0, -1.0, 1.0)))
 
-        # EMA8 distance
+        # ── [8] EMA8 distance z-score ─────────────────────────────────
+        # Raw (close - EMA) / EMA drifts slowly in trending markets.
+        # Rolling z-score over 20 bars removes the drift.
         if len(closes) >= 8:
-            ema8 = _ema(closes, 8)
-            features.append(float(np.clip((closes[-1] - ema8) / (ema8 + 1e-10) * 20, -1, 1)))
+            ema8_dists = _rolling_ema_dists(closes, period=8, lookback=25)
+            features.append(_zscore_last_from_series(ema8_dists))
         else:
             features.append(0.0)
 
-        # EMA21 distance
+        # ── [9] EMA21 distance z-score ────────────────────────────────
         if len(closes) >= 21:
-            ema21 = _ema(closes, 21)
-            features.append(float(np.clip((closes[-1] - ema21) / (ema21 + 1e-10) * 20, -1, 1)))
+            ema21_dists = _rolling_ema_dists(closes, period=21, lookback=35)
+            features.append(_zscore_last_from_series(ema21_dists))
         else:
             features.append(0.0)
 
-        # RSI-like momentum (14 bar)
+        # ── [10] RSI (centred) — bounded, stationary ──────────────────
         if len(closes) >= 15:
             rsi = _rsi(closes, 14)
-            features.append(float((rsi - 50) / 50))  # [-1, 1]
+            features.append(float((rsi - 50.0) / 50.0))
         else:
             features.append(0.0)
 
-        # Volume trend (linear slope over last 10 bars)
-        if len(volumes) >= 10:
-            slope = np.polyfit(np.arange(10), volumes[-10:], 1)[0]
-            avg_vol = np.mean(volumes[-10:]) + 1e-10
-            features.append(float(np.clip(slope / avg_vol, -1, 1)))
+        # ── [11] EMA8 distance velocity — Δ(dist) per bar ─────────────
+        # Rate-of-change of the EMA distance is strictly stationary:
+        # it measures how fast price is moving relative to the trend.
+        if len(closes) >= 10:
+            ema8_dists = _rolling_ema_dists(closes, period=8, lookback=10)
+            if len(ema8_dists) >= 2:
+                velocity = float(ema8_dists[-1] - ema8_dists[-2])
+                features.append(float(np.clip(velocity * 50.0, -1.0, 1.0)))
+            else:
+                features.append(0.0)
         else:
             features.append(0.0)
 
-        # Body ratio
-        body = abs(closes[-1] - opens[-1])
-        shadow = highs[-1] - lows[-1]
-        features.append(float(np.clip(body / (shadow + 1e-10), 0, 1)))
+        # ── [12-14] Candle structure ratios — bounded by construction ──
+        body   = abs(closes[-1] - opens[-1])
+        shadow = highs[-1] - lows[-1] + 1e-10
+        upper  = highs[-1] - max(closes[-1], opens[-1])
+        lower  = min(closes[-1], opens[-1]) - lows[-1]
 
-        # Upper wick
-        upper = highs[-1] - max(closes[-1], opens[-1])
-        features.append(float(np.clip(upper / (shadow + 1e-10), 0, 1)))
+        features.append(float(np.clip(body   / shadow, 0.0, 1.0)))
+        features.append(float(np.clip(upper  / shadow, 0.0, 1.0)))
+        features.append(float(np.clip(lower  / shadow, 0.0, 1.0)))
 
-        # Lower wick
-        lower = min(closes[-1], opens[-1]) - lows[-1]
-        features.append(float(np.clip(lower / (shadow + 1e-10), 0, 1)))
-
+        # Assemble, truncate/pad to exactly n
         arr = np.array(features[:n], dtype=np.float32)
-        # Pad if fewer than n features available
         if len(arr) < n:
             arr = np.pad(arr, (0, n - len(arr)), constant_values=0.0)
 
@@ -274,22 +255,76 @@ def _ohlcv_features(df: pd.DataFrame, n: int) -> np.ndarray:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Micro-utilities (no external deps)
+# Stationarity helpers [C]
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _zscore_last(arr: np.ndarray, window: int = 50) -> float:
+    """
+    Z-score of the last value relative to a rolling window.
+
+    z = (x_t - mean(x_{t-window:t})) / (std(x_{t-window:t}) + ε)
+
+    Clips result to [-3, 3] then rescales to [-1, 1] so extreme
+    outliers don't dominate the observation.
+    """
+    if len(arr) < 3:
+        return 0.0
+    w = min(window, len(arr))
+    window_vals = arr[-w:]
+    mu  = float(np.mean(window_vals))
+    std = float(np.std(window_vals)) + 1e-8
+    z   = (arr[-1] - mu) / std
+    # Map ±3σ → ±1 (outside that is extreme noise, not signal)
+    return float(np.clip(z / 3.0, -1.0, 1.0))
+
+
+def _zscore_last_from_series(series: np.ndarray) -> float:
+    """Z-score of last element from a pre-computed series array."""
+    return _zscore_last(series, window=len(series))
+
+
+def _rolling_ema_dists(closes: np.ndarray, period: int, lookback: int) -> np.ndarray:
+    """
+    Compute (close - EMA_period) / EMA_period for each bar in the
+    last `lookback` bars.  Returns an array of price-relative distances.
+
+    These distances are approximately stationary in a range-bound
+    market; the z-score wrapper handles residual drift in trends.
+    """
+    n_bars = min(lookback, len(closes))
+    dists  = np.zeros(n_bars, dtype=np.float64)
+
+    for i in range(n_bars):
+        end_idx = len(closes) - n_bars + i + 1
+        sub     = closes[:end_idx]
+        if len(sub) < period:
+            continue
+        ema = _ema(sub, period)
+        if ema > 0:
+            dists[i] = (sub[-1] - ema) / ema
+
+    return dists
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Micro-utilities
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _ema(arr: np.ndarray, period: int) -> float:
+    """Exponential moving average of the last element of arr."""
     alpha = 2.0 / (period + 1.0)
-    ema = arr[0]
+    ema   = arr[0]
     for v in arr[1:]:
-        ema = alpha * v + (1 - alpha) * ema
+        ema = alpha * v + (1.0 - alpha) * ema
     return float(ema)
 
 
 def _rsi(arr: np.ndarray, period: int = 14) -> float:
-    diffs = np.diff(arr[-(period + 1):])
-    gains = diffs[diffs > 0]
-    losses = -diffs[diffs < 0]
-    avg_gain = float(np.mean(gains)) if len(gains) > 0 else 1e-10
+    """Wilder RSI on the last `period+1` values of arr."""
+    diffs    = np.diff(arr[-(period + 1):])
+    gains    = diffs[diffs > 0]
+    losses   = -diffs[diffs < 0]
+    avg_gain = float(np.mean(gains))  if len(gains)  > 0 else 1e-10
     avg_loss = float(np.mean(losses)) if len(losses) > 0 else 1e-10
-    rs = avg_gain / avg_loss
-    return float(100 - 100 / (1 + rs))
+    rs       = avg_gain / avg_loss
+    return float(100.0 - 100.0 / (1.0 + rs))

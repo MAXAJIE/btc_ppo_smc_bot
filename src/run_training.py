@@ -25,7 +25,6 @@ import subprocess
 import argparse
 from pathlib import Path
 from dotenv import load_dotenv
-from src.utils.logger import TradeLogger
 
 
 load_dotenv()

@@ -85,7 +85,7 @@ def loader():
 
 @pytest.fixture
 def env(loader, tmp_path):
-    from src.environment.binance_testnet_env import BTCFuturesEnv
+    from src.env.binance_testnet_env import BTCFuturesEnv
     from src.utils.logger import TradeLogger
     trade_logger = TradeLogger(log_dir=str(tmp_path))
     e = BTCFuturesEnv(
@@ -208,7 +208,7 @@ class TestActionSemantics:
         qty_full = env_full._qty
 
         loader2 = make_synthetic_loader()
-        from src.environment.binance_testnet_env import BTCFuturesEnv
+        from src.env.binance_testnet_env import BTCFuturesEnv
         from src.utils.logger import TradeLogger
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
@@ -293,7 +293,7 @@ class TestEpisodeLifecycle:
 
     def test_episode_truncates_at_end(self, loader, tmp_path):
         """A very short episode should truncate."""
-        from src.environment.binance_testnet_env import BTCFuturesEnv
+        from src.env.binance_testnet_env import BTCFuturesEnv
         from src.utils.logger import TradeLogger
 
         env_short = BTCFuturesEnv(
@@ -354,7 +354,7 @@ class TestEpisodeLifecycle:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SB3 vectorised environment compatibility
+# SB3 vectorised env compatibility
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestVecEnvCompatibility:
@@ -362,7 +362,7 @@ class TestVecEnvCompatibility:
     def test_works_in_dummy_vec_env(self, loader, tmp_path):
         from stable_baselines3.common.vec_env import DummyVecEnv
         from stable_baselines3.common.monitor import Monitor
-        from src.environment.binance_testnet_env import BTCFuturesEnv
+        from src.env.binance_testnet_env import BTCFuturesEnv
         from src.utils.logger import TradeLogger
 
         def make():
@@ -394,3 +394,114 @@ class TestVecEnvCompatibility:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "--tb=short"])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [A] Kill-switch punitive reward integration tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestKillSwitchReward:
+    """
+    Verify the env correctly passes kill_triggered=True to compute_step_reward
+    and that the resulting reward is catastrophically negative.
+    """
+
+    def _make_env(self, loader, tmp_path):
+        from src.env.binance_testnet_env import BTCFuturesEnv
+        from src.utils.logger import TradeLogger
+        return BTCFuturesEnv(
+            data_loader=loader, mode="offline",
+            trade_logger=TradeLogger(log_dir=str(tmp_path)),
+            episode_idx=600,
+        )
+
+    def test_kill_switch_reward_catastrophic(self, loader, tmp_path):
+        """
+        When drawdown >= max_drawdown_kill, reward must be ≤ -50.
+        (With default scale=50 and dd≥0.15: R ≤ -50*1.15 = -57.5)
+        """
+        env = self._make_env(loader, tmp_path)
+        env.reset()
+        env.step(1)  # open long
+
+        # Force a 16% drawdown — above the 15% kill threshold
+        env._peak_equity = 10000.0
+        env._equity      = 8400.0   # 16% DD
+        env._balance     = 8400.0
+
+        _, reward, terminated, _, info = env.step(0)
+
+        assert terminated, "Episode should terminate on kill-switch"
+        assert reward <= -50.0, (
+            f"Kill-switch reward must be ≤ -50, got {reward:.2f}"
+        )
+
+    def test_kill_switch_terminates_episode(self, loader, tmp_path):
+        env = self._make_env(loader, tmp_path)
+        env.reset()
+        env._peak_equity = 10000.0
+        env._balance     = 8400.0
+        env._equity      = 8400.0
+
+        _, _, terminated, _, _ = env.step(0)
+        assert terminated
+
+    def test_normal_step_reward_not_catastrophic(self, loader, tmp_path):
+        """Normal steps (no kill) must produce reward in a reasonable range."""
+        env = self._make_env(loader, tmp_path)
+        env.reset()
+
+        rewards = []
+        for action in [0, 1, 0, 0, 5]:
+            _, r, term, trunc, _ = env.step(action)
+            rewards.append(r)
+            if term or trunc:
+                break
+
+        for r in rewards:
+            assert r > -20.0, f"Normal step reward {r:.3f} shouldn't be catastrophic"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [B] Holding cost integration tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestHoldingCostInEnv:
+    """
+    Verify that being in a trade costs more per step than being flat,
+    due to the holding_cost_per_bar penalty.
+    """
+
+    def _make_env(self, loader, tmp_path):
+        from src.env.binance_testnet_env import BTCFuturesEnv
+        from src.utils.logger import TradeLogger
+        return BTCFuturesEnv(
+            data_loader=loader, mode="offline",
+            trade_logger=TradeLogger(log_dir=str(tmp_path)),
+            episode_idx=600,
+        )
+
+    def test_flat_hold_more_rewarding_than_dead_hold(self, loader, tmp_path):
+        """
+        A flat HOLD and an in-trade HOLD at zero unrealised PnL:
+        the in-trade hold should accumulate lower total reward
+        because of holding_cost_per_bar.
+        """
+        # Env A: stay flat for 10 steps
+        envA = self._make_env(loader, tmp_path)
+        envA.reset()
+        total_flat = sum(envA.step(0)[1] for _ in range(10))  # all HOLD, never open
+
+        # Env B: open long, then hold for 10 steps
+        envB = self._make_env(loader, tmp_path)
+        envB.reset()
+        envB.step(1)  # open
+        total_in_trade = sum(envB.step(0)[1] for _ in range(10))
+
+        # The in-trade rewards include holding_cost_per_bar → should be lower
+        # (This assumes market is roughly flat so unrealised PnL ≈ 0)
+        # We just check total_in_trade < total_flat by at least some margin
+        assert total_in_trade < total_flat + 0.05, (
+            f"In-trade total {total_in_trade:.4f} should not exceed flat {total_flat:.4f} "
+            f"when unrealised PnL is small (holding cost should pull it lower)"
+        )

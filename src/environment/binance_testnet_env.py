@@ -35,7 +35,7 @@ import os
 
 from ..features.multi_tf_features import build_observation, OBS_DIM
 from ..features.garch_kelly import GarchKellyEstimator, kelly_position_size
-from ..utils.reward import compute_step_reward, cost_penalty, funding_cost
+from ..utils.reward import compute_step_reward, cost_penalty, funding_cost, killswitch_penalty
 from ..utils.websocket_feed import WebSocketCandleFeed, RESTCandleFeed
 
 logger = logging.getLogger(__name__)
@@ -242,12 +242,17 @@ class BTCFuturesEnv(gym.Env):
             )
 
         # ── Kill-switch ───────────────────────────────────────────────
+        kill_triggered = False
         if drawdown >= self.max_drawdown_kill:
             logger.warning(
-                f"Kill-switch triggered: drawdown={drawdown:.1%} >= {self.max_drawdown_kill:.0%}"
+                f"Kill-switch triggered: drawdown={drawdown:.1%} >= {self.max_drawdown_kill:.0%} "
+                f"| penalty = -{self.cfg['reward'].get('kill_penalty_scale', 50.0) * (1 + drawdown):.1f}"
             )
             if self._position != 0:
-                self._close_position(cur_price, "kill_switch")
+                realized_pnl_pct = self._close_position(cur_price, "kill_switch")
+                trade_closed = True
+                tx_cost += cost_penalty(self._notional, self._balance)
+            kill_triggered = True
             terminated = True
 
         # ── Reward ───────────────────────────────────────────────────
@@ -260,6 +265,7 @@ class BTCFuturesEnv(gym.Env):
             realized_pnl_pct=realized_pnl_pct,
             transaction_cost=tx_cost,
             funding_fee=fund_fee,
+            kill_triggered=kill_triggered,    # [A] punitive penalty
         )
 
         # ── Observation ──────────────────────────────────────────────
@@ -639,7 +645,7 @@ class BTCFuturesEnv(gym.Env):
                 logger.warning(f"_update_live_candles REST fallback failed: {e}")
 
     def close(self):
-        """Clean up resources (called by SB3 on environment teardown)."""
+        """Clean up resources (called by SB3 on env teardown)."""
         if self._ws_feed is not None:
             self._ws_feed.stop()
             self._ws_feed = None

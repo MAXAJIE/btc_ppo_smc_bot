@@ -333,3 +333,124 @@ class TestMultiTFFeatures:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "--tb=short"])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [C] Stationarity tests for multi_tf_features
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestStationarity:
+    """
+    Verify that OHLCV features are approximately stationary.
+
+    Method: generate 10 independent synthetic price series with different
+    starting prices and trends.  For each feature index, check that the
+    variance across series is small (stable distribution) rather than
+    scaling with the price level.
+    """
+
+    def _make_series(self, n=500, start=None, seed=0):
+        rng = np.random.default_rng(seed)
+        p = start or rng.uniform(10_000, 100_000)
+        prices = [p]
+        for _ in range(n - 1):
+            prices.append(prices[-1] * (1 + rng.normal(0, 0.004)))
+        prices = np.array(prices)
+        idx = pd.date_range("2023-01-01", periods=n, freq="5min", tz="UTC")
+        opens  = prices * (1 + rng.uniform(-0.001, 0.001, n))
+        highs  = np.maximum(prices, opens) * (1 + rng.uniform(0, 0.003, n))
+        lows   = np.minimum(prices, opens) * (1 - rng.uniform(0, 0.003, n))
+        vols   = rng.lognormal(10, 0.5, n)
+        return pd.DataFrame({"open": opens, "high": highs, "low": lows,
+                             "close": prices, "volume": vols}, index=idx)
+
+    def test_log_returns_stationary_across_price_levels(self):
+        """Feature[0] (1-bar log-return) must not depend on price level."""
+        from src.features.multi_tf_features import _ohlcv_features
+        # Same returns, different price levels
+        vals = []
+        for start in [5_000, 20_000, 50_000, 100_000]:
+            df = self._make_series(200, start=start, seed=42)
+            feat = _ohlcv_features(df, n=5)
+            vals.append(feat[0])
+        # Log returns from same-seed series should be identical regardless of starting price
+        assert np.std(vals) < 0.05, f"Log return feature varies with price level: {vals}"
+
+    def test_volume_zscore_bounded(self):
+        """Feature[5] (volume z-score) must stay in [-1, 1] across all series."""
+        from src.features.multi_tf_features import _ohlcv_features
+        for seed in range(10):
+            df = self._make_series(200, seed=seed)
+            feat = _ohlcv_features(df, n=6)
+            assert -1.0 <= feat[5] <= 1.0, f"Vol z-score out of bounds: {feat[5]:.4f} (seed={seed})"
+
+    def test_volume_zscore_not_raw_volume(self):
+        """Feature[5] must NOT scale with raw volume magnitude."""
+        from src.features.multi_tf_features import _ohlcv_features
+        # Same price dynamics, volume scaled 100×
+        rng = np.random.default_rng(0)
+        n = 200
+        prices = np.cumprod(1 + rng.normal(0, 0.003, n)) * 50_000
+        idx = pd.date_range("2023-01-01", periods=n, freq="5min", tz="UTC")
+
+        vols_small = np.abs(rng.lognormal(5, 0.3, n))
+        vols_large = vols_small * 100.0
+
+        base = dict(open=prices, high=prices*1.001, low=prices*0.999, close=prices)
+
+        df_small = pd.DataFrame({**base, "volume": vols_small}, index=idx)
+        df_large = pd.DataFrame({**base, "volume": vols_large}, index=idx)
+
+        feat_small = _ohlcv_features(df_small, n=6)[5]
+        feat_large = _ohlcv_features(df_large, n=6)[5]
+
+        # Z-scores should be equal (same dynamics, just scaled)
+        assert abs(feat_small - feat_large) < 0.01, (
+            f"Volume z-score should be scale-invariant: small={feat_small:.4f} large={feat_large:.4f}"
+        )
+
+    def test_ema_distance_zscore_bounded(self):
+        """Features[8,9] (EMA distances) must stay in [-1, 1]."""
+        from src.features.multi_tf_features import _ohlcv_features
+        for seed in range(8):
+            df = self._make_series(200, seed=seed)
+            feat = _ohlcv_features(df, n=10)
+            for idx_feat in [8, 9]:
+                assert -1.0 <= feat[idx_feat] <= 1.0, (
+                    f"EMA dist z-score[{idx_feat}] out of bounds: {feat[idx_feat]:.4f} seed={seed}"
+                )
+
+    def test_ema_velocity_stationary(self):
+        """Feature[11] (EMA velocity) must be near zero in a flat market."""
+        from src.features.multi_tf_features import _ohlcv_features
+        # Flat market: constant price
+        n = 50
+        prices = np.full(n, 50_000.0)
+        idx = pd.date_range("2023-01-01", periods=n, freq="5min", tz="UTC")
+        df = pd.DataFrame({
+            "open": prices, "high": prices + 1, "low": prices - 1,
+            "close": prices, "volume": np.ones(n) * 1000
+        }, index=idx)
+        feat = _ohlcv_features(df, n=12)
+        assert abs(feat[11]) < 0.05, f"EMA velocity in flat market should be ~0, got {feat[11]:.4f}"
+
+    def test_all_features_finite(self):
+        """Stationarity overhaul must not introduce NaN or Inf."""
+        from src.features.multi_tf_features import _ohlcv_features
+        for seed in range(10):
+            df = self._make_series(300, seed=seed)
+            feat = _ohlcv_features(df, n=15)
+            assert np.all(np.isfinite(feat)), f"Non-finite features at seed={seed}: {feat}"
+
+    def test_zscore_helper(self):
+        from src.features.multi_tf_features import _zscore_last
+        arr = np.array([1.0, 2.0, 3.0, 4.0, 100.0])  # outlier at end
+        z = _zscore_last(arr, window=5)
+        # Result should be within [-1, 1] (clipped to 3σ then /3)
+        assert -1.0 <= z <= 1.0
+
+    def test_zscore_zero_for_constant_series(self):
+        from src.features.multi_tf_features import _zscore_last
+        arr = np.ones(50) * 42.0
+        z = _zscore_last(arr, window=20)
+        assert z == pytest.approx(0.0, abs=1e-6)
