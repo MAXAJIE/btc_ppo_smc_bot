@@ -54,7 +54,7 @@ image = (
         "fastparquet>=2024.2.0",
     )
     # Copy the entire project into the container
-    .add_local_dir(".", remote_path="/app", ignore=["__pycache__", "*.pyc", ".git", "logs", ".env"])
+    .add_local_dir(".", remote_path="/app", ignore=["__pycache__", "*.pyc", ".git", "logs", ".environment"])
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -86,7 +86,7 @@ def train_offline(
     sys.path.insert(0, "/app")
     os.chdir("/app")
 
-    # Override env vars to use volume paths
+    # Override environment vars to use volume paths
     os.environ["MODEL_SAVE_PATH"] = f"{VOLUME_MOUNT}/models"
     os.environ["DATA_PATH"] = f"{VOLUME_MOUNT}/data"
     os.environ["LOG_PATH"] = f"{VOLUME_MOUNT}/logs"

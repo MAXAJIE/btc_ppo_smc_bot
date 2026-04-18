@@ -85,7 +85,7 @@ def loader():
 
 @pytest.fixture
 def env(loader, tmp_path):
-    from src.env.binance_testnet_env import BTCFuturesEnv
+    from src.environment.binance_testnet_env import BTCFuturesEnv
     from src.utils.logger import TradeLogger
     trade_logger = TradeLogger(log_dir=str(tmp_path))
     e = BTCFuturesEnv(
@@ -208,7 +208,7 @@ class TestActionSemantics:
         qty_full = env_full._qty
 
         loader2 = make_synthetic_loader()
-        from src.env.binance_testnet_env import BTCFuturesEnv
+        from src.environment.binance_testnet_env import BTCFuturesEnv
         from src.utils.logger import TradeLogger
         import tempfile
         with tempfile.TemporaryDirectory() as tmp:
@@ -293,7 +293,7 @@ class TestEpisodeLifecycle:
 
     def test_episode_truncates_at_end(self, loader, tmp_path):
         """A very short episode should truncate."""
-        from src.env.binance_testnet_env import BTCFuturesEnv
+        from src.environment.binance_testnet_env import BTCFuturesEnv
         from src.utils.logger import TradeLogger
 
         env_short = BTCFuturesEnv(
@@ -354,7 +354,7 @@ class TestEpisodeLifecycle:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SB3 vectorised env compatibility
+# SB3 vectorised environment compatibility
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestVecEnvCompatibility:
@@ -362,7 +362,7 @@ class TestVecEnvCompatibility:
     def test_works_in_dummy_vec_env(self, loader, tmp_path):
         from stable_baselines3.common.vec_env import DummyVecEnv
         from stable_baselines3.common.monitor import Monitor
-        from src.env.binance_testnet_env import BTCFuturesEnv
+        from src.environment.binance_testnet_env import BTCFuturesEnv
         from src.utils.logger import TradeLogger
 
         def make():

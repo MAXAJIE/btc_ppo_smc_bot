@@ -48,7 +48,7 @@ else:
     LOG_DIR = "./logs"
     print("[Local] Running locally. Saving to ./models, ./data, ./logs")
 
-# Override env vars used by data_loader, logger, etc.
+# Override environment vars used by data_loader, logger, etc.
 os.environ["MODEL_SAVE_PATH"] = MODEL_DIR
 os.environ["DATA_PATH"] = DATA_DIR
 os.environ["LOG_PATH"] = LOG_DIR

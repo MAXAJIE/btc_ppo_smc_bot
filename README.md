@@ -40,8 +40,8 @@ pip install -r requirements.txt
 ### 2. Configure API keys
 
 ```bash
-cp .env.example .env
-# Edit .env:
+cp .environment.example .environment
+# Edit .environment:
 #   BINANCE_TESTNET_API_KEY=...
 #   BINANCE_TESTNET_API_SECRET=...
 #   TRAIN_BACKEND=local   # or modal or lightning
@@ -134,7 +134,7 @@ python train_lightning.py
 To control Studios programmatically from outside:
 ```bash
 pip install lightning-sdk
-# Add LIGHTNING_USER_ID and LIGHTNING_API_KEY to .env
+# Add LIGHTNING_USER_ID and LIGHTNING_API_KEY to .environment
 TRAIN_BACKEND=lightning python run_training.py
 ```
 

@@ -109,7 +109,7 @@ def extract_smc_features(df: pd.DataFrame, current_price: float) -> np.ndarray:
         ], dtype=np.float32)
 
     except Exception as e:
-        # Graceful degradation — never crash the env
+        # Graceful degradation — never crash the environment
         return np.zeros(8, dtype=np.float32)
 
 

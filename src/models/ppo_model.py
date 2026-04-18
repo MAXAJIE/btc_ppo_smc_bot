@@ -90,7 +90,7 @@ def build_ppo(env, cfg=None) -> PPO:
 
 
 def load_ppo(path: str, env) -> PPO:
-    """Load a saved PPO model and attach a new env."""
+    """Load a saved PPO model and attach a new environment."""
     model = PPO.load(path, env=env, device="auto")
     logger.info(f"PPO loaded from {path}")
     return model
@@ -120,7 +120,7 @@ def make_callbacks(model_dir: str, eval_env=None, save_freq: int = 100_000) -> l
     )
     callbacks.append(ckpt_cb)
 
-    # Eval callback (if eval env provided)
+    # Eval callback (if eval environment provided)
     if eval_env is not None:
         eval_cb = EvalCallback(
             eval_env,

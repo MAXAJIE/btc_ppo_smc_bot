@@ -38,7 +38,7 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv
 
-from src.env.binance_testnet_env import BTCFuturesEnv
+from src.environment.binance_testnet_env import BTCFuturesEnv
 from src.execution.binance_executor import BinanceFuturesExecutor
 from src.utils.data_loader import DataLoader
 from src.utils.logger import TradeLogger
@@ -237,7 +237,7 @@ def _run_live_episode(model: PPO, env: BTCFuturesEnv, cfg: dict):
 
     Note: PPO.learn() internally collects rollouts. For true online
     fine-tuning we run model.predict() to generate actions, then call
-    env.step() manually, collecting data for the next learn() call.
+    environment.step() manually, collecting data for the next learn() call.
 
     For simplicity we use SB3's built-in collect_rollouts via
     model.learn(total_timesteps=episode_steps).
@@ -278,7 +278,7 @@ def _walk_forward_validation(model: PPO, loader: DataLoader, cfg: dict):
     Evaluate the model on the most recent historical data not used in training.
     Logs performance metrics.
     """
-    from src.env.binance_testnet_env import BTCFuturesEnv
+    from src.environment.binance_testnet_env import BTCFuturesEnv
     from src.utils.logger import TradeLogger
 
     try:

@@ -80,7 +80,7 @@ features:
 ppo:
   policy: "MlpPolicy"
   learning_rate: 0.0003
-  n_steps: 2048                 # rollout buffer size per env
+  n_steps: 2048                 # rollout buffer size per environment
   batch_size: 256
   n_epochs: 10
   gamma: 0.995                  # high discount — long episode

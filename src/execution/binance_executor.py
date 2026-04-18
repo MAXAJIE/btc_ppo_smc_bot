@@ -48,7 +48,7 @@ class BinanceFuturesExecutor:
 
         if not api_key or not api_secret:
             raise ValueError(
-                "BINANCE_TESTNET_API_KEY and BINANCE_TESTNET_API_SECRET must be set in .env"
+                "BINANCE_TESTNET_API_KEY and BINANCE_TESTNET_API_SECRET must be set in .environment"
             )
 
         # python-binance Client with testnet=True for futures
@@ -238,7 +238,7 @@ class BinanceFuturesExecutor:
             return 0.0
 
     # ─────────────────────────────────────────────────────────────────
-    # Stop Loss / Take Profit (set as orders, not just env-side logic)
+    # Stop Loss / Take Profit (set as orders, not just environment-side logic)
     # ─────────────────────────────────────────────────────────────────
 
     def set_stop_loss(self, side: str, stop_price: float, qty: float) -> Tuple[bool, dict]:

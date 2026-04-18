@@ -33,7 +33,7 @@ import numpy as np
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 
-from src.env.binance_testnet_env import BTCFuturesEnv
+from src.environment.binance_testnet_env import BTCFuturesEnv
 from src.utils.data_loader import DataLoader
 from src.utils.logger import TradeLogger
 from src.models.ppo_model import build_ppo, save_ppo, evaluate_model, make_callbacks
@@ -46,7 +46,7 @@ def load_cfg():
 
 
 def make_env(data_loader: DataLoader, trade_logger: TradeLogger, seed: int = 0):
-    """Factory function for vectorised env creation."""
+    """Factory function for vectorised environment creation."""
     def _init():
         env = BTCFuturesEnv(
             data_loader=data_loader,
@@ -100,7 +100,7 @@ def main(
     else:
         env = SubprocVecEnv([make_env(loader, trade_logger, seed=i) for i in range(n_envs)])
 
-    # Eval env (single, deterministic)
+    # Eval environment (single, deterministic)
     eval_env = DummyVecEnv([make_env(loader, TradeLogger())])
 
     # ── 3. Build or load model ────────────────────────────────────────

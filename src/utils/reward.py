@@ -1,7 +1,7 @@
 """
 reward.py
 ─────────
-Pure reward calculations — no env state, fully unit-testable.
+Pure reward calculations — no environment state, fully unit-testable.
 
 Reward philosophy
 ─────────────────

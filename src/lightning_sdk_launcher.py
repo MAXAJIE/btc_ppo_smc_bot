@@ -6,7 +6,7 @@ and download the resulting model checkpoint.
 
 Requires:
     pip install lightning-sdk
-    LIGHTNING_USER_ID and LIGHTNING_API_KEY in .env
+    LIGHTNING_USER_ID and LIGHTNING_API_KEY in .environment
 
 Usage:
     # Start training on Lightning.ai from your local machine:
@@ -61,7 +61,7 @@ def get_studio():
     user_id = os.getenv("LIGHTNING_USER_ID", "")
     if not user_id:
         logger.error(
-            "LIGHTNING_USER_ID not set in .env.\n"
+            "LIGHTNING_USER_ID not set in .environment.\n"
             "Find it at: https://lightning.ai/<username>/home?settings=keys"
         )
         sys.exit(1)

@@ -57,7 +57,7 @@ class WebSocketCandleFeed:
     Streams 1m futures klines via Binance WebSocket and maintains
     rolling OHLCV DataFrames for 5m / 15m / 1h / 4h / 1d.
 
-    Thread-safe: can be read from the env thread while the WS
+    Thread-safe: can be read from the environment thread while the WS
     update thread writes.
     """
 

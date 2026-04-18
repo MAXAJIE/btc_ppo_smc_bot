@@ -1,11 +1,11 @@
 """
 run_training.py
 ────────────────
-Unified training launcher. Reads TRAIN_BACKEND from .env and
+Unified training launcher. Reads TRAIN_BACKEND from .environment and
 dispatches to the correct backend.
 
 Usage:
-    # Set TRAIN_BACKEND in your .env (or export it), then:
+    # Set TRAIN_BACKEND in your .environment (or export it), then:
     python run_training.py
 
     # Or override inline:
@@ -41,7 +41,7 @@ def parse_args():
         "--backend",
         choices=VALID_BACKENDS,
         default=None,
-        help="Training backend (overrides TRAIN_BACKEND env var)",
+        help="Training backend (overrides TRAIN_BACKEND environment var)",
     )
     parser.add_argument("--timesteps", type=int, default=None)
     parser.add_argument("--n-envs", type=int, default=0)
@@ -159,7 +159,7 @@ def _launch_via_lightning_sdk(args):
     """
     Programmatically start a Lightning.ai Studio and run training.
     Requires: pip install lightning-sdk
-    Requires: LIGHTNING_USER_ID and LIGHTNING_API_KEY in .env
+    Requires: LIGHTNING_USER_ID and LIGHTNING_API_KEY in .environment
     """
     from lightning_sdk import Studio, Machine
 
@@ -168,7 +168,7 @@ def _launch_via_lightning_sdk(args):
 
     if not user_id or not api_key:
         print(
-            "ERROR: LIGHTNING_USER_ID and LIGHTNING_API_KEY must be set in .env\n"
+            "ERROR: LIGHTNING_USER_ID and LIGHTNING_API_KEY must be set in .environment\n"
             "Find them at: https://lightning.ai/<username>/home?settings=keys"
         )
         sys.exit(1)
