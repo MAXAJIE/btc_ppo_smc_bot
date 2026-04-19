@@ -33,7 +33,7 @@ import numpy as np
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 
-from src.environment.binance_testnet_env import BTCFuturesEnv
+from src.environment.binance_testnet_env import BinanceEnv
 from src.utils.data_loader import DataLoader
 from src.utils.logger import TradeLogger
 from src.models.ppo_model import build_ppo, save_ppo, evaluate_model, make_callbacks
@@ -48,7 +48,7 @@ def load_cfg():
 def make_env(data_loader: DataLoader, trade_logger: TradeLogger, seed: int = 0):
     """Factory function for vectorised env creation."""
     def _init():
-        env = BTCFuturesEnv(
+        env = BinanceEnv(
             data_loader=data_loader,
             mode="offline",
             trade_logger=trade_logger,

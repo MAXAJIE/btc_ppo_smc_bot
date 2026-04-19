@@ -182,3 +182,82 @@ def build_aligned_dataset(all_tf: Dict[str, pd.DataFrame]) -> pd.DataFrame:
         ).set_index("timestamp").drop(columns=[f"ts_{tf}"], errors="ignore")
 
     return base
+
+
+# ---------------------------------------------------------------------------
+# Backward-compatibility class
+# train_lightning.py does:  from src.utils.data_loader import DataLoader
+# ---------------------------------------------------------------------------
+
+class DataLoader:
+    """
+    Class-based wrapper around the module-level functions.
+
+    Usage (as expected by train_lightning.py):
+        dl = DataLoader(data_dir="./data", years=2)
+        tf_data = dl.load()          # dict[str, pd.DataFrame]
+        df_5m   = dl.get("5m")
+        aligned = dl.aligned         # flat 5m-indexed DataFrame with HTF cols
+    """
+
+    def __init__(
+        self,
+        data_dir: str = "./data",
+        years: int = 2,
+        symbol: str = SYMBOL,
+        force_refresh: bool = False,
+    ):
+        global DATA_DIR
+        DATA_DIR = Path(data_dir)
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+        # Scale candle limits by requested years (default constants are 2 yrs)
+        self._scale = years / 2.0
+        self._force = force_refresh
+        self._tf_data: Dict[str, pd.DataFrame] = {}
+        self._aligned: pd.DataFrame | None = None
+
+    # ------------------------------------------------------------------
+    def load(self) -> Dict[str, pd.DataFrame]:
+        """Download / load all timeframes. Returns dict[str, pd.DataFrame]."""
+        # Temporarily adjust limits for the requested year span
+        original_limits = dict(CANDLE_LIMITS)
+        for k in CANDLE_LIMITS:
+            CANDLE_LIMITS[k] = int(original_limits[k] * self._scale)
+
+        try:
+            self._tf_data = load_all_timeframes(force_refresh=self._force)
+        finally:
+            CANDLE_LIMITS.update(original_limits)   # restore
+
+        return self._tf_data
+
+    def get(self, timeframe: str) -> pd.DataFrame:
+        """Return the DataFrame for a single timeframe (loads all if not yet loaded)."""
+        if not self._tf_data:
+            self.load()
+        if timeframe not in self._tf_data:
+            raise KeyError(
+                f"Timeframe '{timeframe}' not available. "
+                f"Available: {list(self._tf_data.keys())}"
+            )
+        return self._tf_data[timeframe]
+
+    @property
+    def aligned(self) -> pd.DataFrame:
+        """5m DataFrame with HTF context columns merged in (as-of, no look-ahead)."""
+        if not self._tf_data:
+            self.load()
+        if self._aligned is None:
+            self._aligned = build_aligned_dataset(self._tf_data)
+        return self._aligned
+
+    @property
+    def tf_data(self) -> Dict[str, pd.DataFrame]:
+        """Raw dict of per-timeframe DataFrames."""
+        if not self._tf_data:
+            self.load()
+        return self._tf_data
+
+    def __getitem__(self, timeframe: str) -> pd.DataFrame:
+        return self.get(timeframe)

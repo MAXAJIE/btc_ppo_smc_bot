@@ -193,3 +193,55 @@ def compute_reward(
         reward -= dd_pen
 
     return float(np.clip(reward, -5.0, 5.0))   # hard clip prevents single spike
+
+
+# ---------------------------------------------------------------------------
+# Backward-compatibility shims
+# (train_lightning.py / __init__.py imported these old names)
+# ---------------------------------------------------------------------------
+
+def compute_step_reward(
+    action: int,
+    prev_position: int,
+    new_position: int,
+    realised_pnl_pct: float,
+    unrealised_pct: float,
+    equity: float,
+    state: RewardState,
+    **kwargs,
+) -> float:
+    """Alias for compute_reward (old name used by train_lightning.py)."""
+    return compute_reward(
+        action=action,
+        prev_position=prev_position,
+        new_position=new_position,
+        realised_pnl_pct=realised_pnl_pct,
+        unrealised_pct=unrealised_pct,
+        equity=equity,
+        state=state,
+        **kwargs,
+    )
+
+
+def trade_reward(realised_pnl_pct: float) -> float:
+    """
+    Alias for the closed-trade portion of compute_reward.
+    Returns the log-scaled win/loss reward for a completed trade.
+    """
+    if abs(realised_pnl_pct) < 1e-6:
+        return 0.0
+    mag = math.log(1 + abs(realised_pnl_pct) * 100)
+    return WIN_SCALE * mag if realised_pnl_pct > 0 else -LOSS_SCALE * mag
+
+
+def cost_penalty(position: int = 1, step: int = 0) -> float:
+    """
+    Alias for the per-step cost deduction (old name used by __init__.py).
+    Returns the negative cost for the given step.
+    """
+    cost = 0.0
+    if position != 0:
+        cost += COMMISSION_RATE + SLIPPAGE_RATE
+    if step % FUNDING_STEPS == 0 and position != 0:
+        cost += FUNDING_RATE
+    return -cost
