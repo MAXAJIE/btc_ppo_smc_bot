@@ -54,7 +54,7 @@ image = (
         "fastparquet>=2024.2.0",
     )
     # Copy the entire project into the container
-    .add_local_dir(".", remote_path="/app", ignore=["__pycache__", "*.pyc", ".git", "logs", ".environment"])
+    .add_local_dir(".", remote_path="/root/btc_ppo_smc_bot", ignore=["__pycache__", "*.pyc", ".git", "logs", "data", "*.csv", "*.png"])
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -63,16 +63,16 @@ image = (
 
 @app.function(
     image=image,
-    gpu="A10G",                          # Good cost/perf for RL (non-LLM)
+    gpu="h100",                          # Good cost/perf for RL (non-LLM)
     volumes={VOLUME_MOUNT: volume},
     secrets=[modal.Secret.from_name("binance-secrets")],
     timeout=60 * 60 * 23,               # 23h — restart before Modal's 24h limit
     memory=16384,                        # 16 GB RAM
-    cpu=4.0,
+    cpu=16.0,
 )
 def train_offline(
     total_timesteps: int = 3_000_000,
-    n_envs: int = 4,
+    n_envs: int = 64,
     resume_from: str = None,
 ):
     """
@@ -83,8 +83,10 @@ def train_offline(
     """
     import sys
     import os
-    sys.path.insert(0, "/app")
-    os.chdir("/app")
+    project_root = "/root/btc_ppo_smc_bot"
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+    os.chdir(project_root)
 
     # Override environment vars to use volume paths
     os.environ["MODEL_SAVE_PATH"] = f"{VOLUME_MOUNT}/models"
@@ -125,7 +127,7 @@ def train_offline(
     image=image,
     volumes={VOLUME_MOUNT: volume},
     timeout=60 * 60 * 2,               # 2h for data download
-    memory=4096,
+    memory=8172,
 )
 def download_data(years: int = 2):
     """Download and cache historical data into the volume."""
@@ -133,6 +135,16 @@ def download_data(years: int = 2):
     import os
     sys.path.insert(0, "/app")
     os.chdir("/app")
+    project_root = "/root/btc_ppo_smc_bot"
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+
+    os.chdir(project_root)
+
+    # 验证是否能看到 src 文件夹
+    if not os.path.exists(os.path.join(project_root, "src")):
+        print(f"Error: src folder not found in {project_root}")
+        print(f"Contents of {project_root}: {os.listdir(project_root)}")
 
     from src.utils.data_loader import DataLoader
     loader = DataLoader(data_dir=f"{VOLUME_MOUNT}/data")
@@ -149,7 +161,7 @@ def download_data(years: int = 2):
 @app.local_entrypoint()
 def main(
     timesteps: int = 3_000_000,
-    n_envs: int = 4,
+    n_envs: int = 64,
     download_only: bool = False,
     resume: str = None,
 ):

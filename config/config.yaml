@@ -127,7 +127,7 @@ live:
 
 # ── Modal ─────────────────────────────────────────────────────────
 modal:
-  gpu: "A10G"                   # A10G = good cost/perf for RL (not LLM)
+  gpu: "h100"                   # A10G = good cost/perf for RL (not LLM)
   timeout_hours: 23             # Modal max timeout ~24h; restart externally
   volume_name: "btc-ppo-vol"
   secret_name: "binance-secrets"

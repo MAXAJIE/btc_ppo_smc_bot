@@ -81,8 +81,8 @@ def auto_n_envs(n_gpus: int, requested: int) -> int:
         return requested
     if n_gpus > 0:
         # 针对 Lightning AI 的高性能 GPU 调优
-        return 8 if n_gpus == 1 else 32
-    return 2
+        return 128 if n_gpus == 1 else 256
+    return 8
 
 
 def main():
