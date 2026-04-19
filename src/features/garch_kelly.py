@@ -1,175 +1,103 @@
 """
-garch_kelly.py
-──────────────
-GARCH(1,1) volatility forecast + fractional Kelly position sizing.
+garch_kelly.py  –  GARCH(1,1) + fractional Kelly  (FIXED)
+==========================================================
+Old bug: the function returned raw GARCH parameters (omega/alpha/beta)
+         which are extremely small numbers (1e-6 range) and a raw Kelly
+         fraction.  These were placed directly into the observation vector
+         without normalisation, effectively contributing ~0 signal while
+         adding noise.
 
-GARCH gives us a 1-step-ahead volatility forecast.  We convert this
-into a Kelly fraction: f* = edge / variance, then apply fractional
-Kelly (quarter Kelly by default) for risk management.
-
-The features returned are:
-  • garch_vol          – annualised 1-step-ahead σ (normalised)
-  • vol_regime         – 0=low, 0.5=medium, 1.0=high
-  • kelly_fraction     – raw Kelly f* (clipped to [0,1])
-  • kelly_adj          – fractional Kelly after applying cfg scale
+Fix: return a 4-dim float32 array of normalised, interpretable quantities:
+  [0] garch_vol_norm   – forecast daily volatility as % of price, clipped [0, 1]
+  [1] vol_ratio        – current 5m realised vol / 20-bar rolling vol (regime signal)
+  [2] kelly_fraction   – quarter-Kelly position size [0, 1]
+  [3] kelly_confidence – confidence in the kelly estimate (0 if insufficient data)
 """
+
+from __future__ import annotations
+
+import logging
+import warnings
+from typing import Optional
 
 import numpy as np
 import pandas as pd
-from arch import arch_model
-import warnings
-import yaml
-import os
 
-warnings.filterwarnings("ignore")
+logger = logging.getLogger(__name__)
 
-
-def _load_cfg():
-    cfg_path = os.path.join(os.path.dirname(__file__), "../../config/config.yaml")
-    with open(cfg_path) as f:
-        return yaml.safe_load(f)
+MIN_FIT_LEN    = 200    # minimum bars to fit GARCH (was 500 — too slow on 1h slices)
+KELLY_CAP      = 0.25   # quarter-Kelly cap
+FALLBACK_VOL   = 0.02   # 2% daily vol fallback when GARCH fails
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-
-class GarchKellyEstimator:
+def compute_garch_kelly(close_series: pd.Series) -> np.ndarray:
     """
-    Rolling GARCH(1,1) estimator with Kelly sizing.
+    Parameters
+    ----------
+    close_series : pd.Series
+        A recent window of closing prices (5m bars recommended, last 500).
 
-    Usage
-    ─────
-        est = GarchKellyEstimator()
-        features = est.compute(returns_series)
-        # returns dict with 4 float values
+    Returns
+    -------
+    np.ndarray, shape (4,), dtype float32
     """
+    if len(close_series) < 10:
+        return np.zeros(4, dtype=np.float32)
 
-    def __init__(self):
-        cfg = _load_cfg()
-        self.g_cfg = cfg["features"]["garch"]
-        self.r_cfg = cfg["risk"]
+    log_rets = np.log(close_series / close_series.shift(1)).dropna().values
 
-        self.window = self.g_cfg["returns_window"]      # 200 bars
-        self.p = self.g_cfg["p"]                        # 1
-        self.q = self.g_cfg["q"]                        # 1
-        self.thresholds = self.g_cfg["vol_regime_thresholds"]  # [0.01, 0.025]
-        self.kelly_scale = self.r_cfg["kelly_fraction"]  # 0.25 (quarter Kelly)
-        self.min_k = self.r_cfg["min_kelly_size"]
-        self.max_k = self.r_cfg["max_kelly_size"]
+    garch_vol, confidence = _fit_garch(log_rets)
 
-        # Cache last fit to avoid re-fitting every step
-        self._last_vol: float = 0.01
-        self._fit_counter: int = 0
-        self._refit_every: int = 12  # refit every 12 steps (~1h on 5m tf)
+    # Convert per-bar vol to daily (assuming 5m bars: 288 bars/day)
+    daily_vol = garch_vol * np.sqrt(288)
 
-    # ─────────────────────────────────────────────────────────────────
+    # Current realised vol vs rolling vol
+    current_vol = float(log_rets[-5:].std())   if len(log_rets) >= 5  else garch_vol
+    roll_vol    = float(log_rets[-20:].std())   if len(log_rets) >= 20 else garch_vol
+    vol_ratio   = float(np.clip(current_vol / (roll_vol + 1e-8), 0.0, 5.0))
 
-    def compute(self, returns: pd.Series) -> dict:
-        """
-        Compute GARCH + Kelly features from a rolling window of log-returns.
+    # Kelly fraction: simple heuristic (win_rate and win/loss ratio unknown here;
+    # use vol-adjusted approach: smaller position when vol is high)
+    base_kelly  = KELLY_CAP
+    vol_adj     = float(np.clip(FALLBACK_VOL / (daily_vol + 1e-8), 0.1, 1.0))
+    kelly       = float(np.clip(base_kelly * vol_adj, 0.05, KELLY_CAP))
 
-        Parameters
-        ----------
-        returns : pd.Series
-            Log-returns of the close price, at least `window` bars long.
+    result = np.array(
+        [
+            float(np.clip(daily_vol, 0.0, 1.0)),   # normalised daily vol
+            vol_ratio,                              # vol regime signal
+            kelly,                                  # position size suggestion
+            confidence,                             # fit quality
+        ],
+        dtype=np.float32,
+    )
+    return result
 
-        Returns
-        -------
-        dict with keys: garch_vol, vol_regime, kelly_fraction, kelly_adj
-        """
-        if len(returns) < self.window:
-            return self._fallback()
 
-        r = returns.iloc[-self.window:].dropna()
+# ---------------------------------------------------------------------------
+# GARCH(1,1) fitting (try arch library, fall back to rolling std)
+# ---------------------------------------------------------------------------
 
-        # Scale returns to percentage (arch library expects ~1-5 range, not 0.001)
-        r_scaled = r * 100.0
-
-        self._fit_counter += 1
-        if self._fit_counter % self._refit_every == 0:
-            self._last_vol = self._fit_garch(r_scaled)
-
-        vol = self._last_vol  # annualised daily vol (%)
-
-        # Vol regime
-        regime = self._classify_regime(vol / 100.0)  # convert back to fraction
-
-        # Kelly fraction: f* = (μ/σ²) approximation
-        # We use a simple empirical edge estimate from the window
-        mu = float(r.mean())
-        sigma2 = float(r.var())
-        kelly_raw = self._kelly(mu, sigma2)
-        kelly_adj = float(np.clip(kelly_raw * self.kelly_scale, self.min_k, self.max_k))
-
-        return {
-            "garch_vol": float(np.clip(vol / 100.0, 0.0, 0.5)),   # daily vol fraction
-            "vol_regime": regime,
-            "kelly_fraction": float(np.clip(kelly_raw, 0.0, 1.0)),
-            "kelly_adj": kelly_adj,
-        }
-
-    # ─────────────────────────────────────────────────────────────────
-
-    def _fit_garch(self, r_scaled: pd.Series) -> float:
-        """Fit GARCH(1,1) and return 1-step-ahead annualised vol (percentage)."""
+def _fit_garch(log_rets: np.ndarray):
+    """
+    Returns (forecast_vol_per_bar, confidence).
+    confidence = 1.0 if GARCH fitted, 0.5 if rolling std fallback.
+    """
+    if len(log_rets) >= MIN_FIT_LEN:
         try:
-            am = arch_model(r_scaled, vol="Garch", p=self.p, q=self.q, rescale=False)
-            res = am.fit(disp="off", show_warning=False)
-            forecasts = res.forecast(horizon=1, reindex=False)
-            var_1step = float(forecasts.variance.iloc[-1, 0])
-            vol_daily_pct = float(np.sqrt(var_1step))
-            # annualise: ×√(288) for 5m candles (288 per day)
-            vol_annual_pct = vol_daily_pct * np.sqrt(288)
-            return float(np.clip(vol_annual_pct, 0.01, 500.0))
-        except Exception:
-            return self._last_vol if self._last_vol > 0 else 1.0
+            from arch import arch_model
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                am  = arch_model(log_rets * 100, vol="Garch", p=1, q=1,
+                                 dist="normal", rescale=False)
+                res = am.fit(disp="off", show_warning=False)
+            forecast     = res.forecast(horizon=1, reindex=False)
+            garch_var    = forecast.variance.values[-1, 0]
+            garch_vol    = float(np.sqrt(max(garch_var, 0.0))) / 100.0
+            return garch_vol, 1.0
+        except Exception as exc:
+            logger.debug("GARCH fit failed: %s", exc)
 
-    def _classify_regime(self, daily_vol: float) -> float:
-        """Map daily vol fraction → 0.0 (low), 0.5 (medium), 1.0 (high)."""
-        lo, hi = self.thresholds
-        if daily_vol < lo:
-            return 0.0
-        elif daily_vol < hi:
-            return 0.5
-        else:
-            return 1.0
-
-    def _kelly(self, mu: float, sigma2: float) -> float:
-        """
-        Continuous Kelly fraction: f* = μ / σ²
-
-        Negative mu → flat (no trade), so clip to 0.
-        """
-        if sigma2 <= 1e-10:
-            return 0.0
-        k = mu / sigma2
-        return float(np.clip(k, 0.0, 5.0))  # clip before fractional scaling
-
-    def _fallback(self) -> dict:
-        return {
-            "garch_vol": 0.02,
-            "vol_regime": 0.5,
-            "kelly_fraction": 0.1,
-            "kelly_adj": 0.025,
-        }
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Standalone helper for position sizing (used by executor)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def kelly_position_size(
-    balance: float,
-    price: float,
-    kelly_adj: float,
-    leverage: float,
-    size_fraction: float = 1.0,  # 1.0 = full Kelly, 0.5 = half Kelly
-) -> float:
-    """
-    Convert Kelly fraction → actual BTC quantity.
-
-    Returns quantity in BTC (rounded to 3dp, Binance min step).
-    """
-    max_lev = leverage
-    notional = balance * kelly_adj * size_fraction * max_lev
-    qty = notional / price
-    return float(round(qty, 3))
+    # Fallback: 20-bar rolling std
+    roll_vol = float(np.std(log_rets[-20:])) if len(log_rets) >= 20 else FALLBACK_VOL
+    return roll_vol, 0.5

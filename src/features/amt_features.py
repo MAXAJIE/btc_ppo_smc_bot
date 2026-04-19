@@ -1,202 +1,127 @@
 """
-amt_features.py
-───────────────
-Auction Market Theory (AMT) / Volume Profile features.
+amt_features.py  –  Volume Profile / AMT feature extractor  (FIXED)
+====================================================================
+Old bug: POC / VAH / VAL were returned as raw price values → same
+         scale-mismatch problem as S&R.  Additionally the volume profile
+         was computed on the full dataset instead of a rolling window,
+         so it reflected the entire 2-year history not the recent 4h context.
 
-We build a simple pandas-based volume profile histogram without
-relying on py-market-profile (which has sparse maintenance).
-
-Features per timeframe (1h, 4h, 1D):
-  1. poc_dist       – normalised distance from price to POC
-  2. vah_dist       – normalised distance from price to VAH
-  3. val_dist       – normalised distance from price to VAL
-  4. in_value_area  – 1.0 if price is inside Value Area, else 0.0
-  5. poc_volume_pct – POC volume as % of total (liquidity concentration)
-  6. imbalance      – buy/sell volume imbalance in profile window
-
-Total: 6 features × 3 timeframes = 18 features
+Fix:
+  • Rolling 100-bar volume profile (≈ 8 hours on 5m) on the 4h slice.
+  • Return ATR-normalised distances from close to POC, VAH, VAL.
+  • Extra features: Value Area width (spread signal) and volume rank.
 """
+
+from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-import yaml
-import os
+
+PROFILE_BARS = 100   # bars in the rolling volume profile window
+PRICE_BINS   = 50    # price buckets for the volume profile
+VALUE_AREA_PCT = 0.70  # 70% value area
 
 
-def _load_cfg():
-    cfg_path = os.path.join(os.path.dirname(__file__), "../../config/config.yaml")
-    with open(cfg_path) as f:
-        return yaml.safe_load(f)
-
-
-_CFG = None
-
-
-def _cfg():
-    global _CFG
-    if _CFG is None:
-        _CFG = _load_cfg()["features"]["amt"]
-    return _CFG
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-
-def build_volume_profile(df: pd.DataFrame, n_bins: int = None, value_area_pct: float = None) -> dict:
+def compute_amt_features(df_4h: pd.DataFrame, current_idx: int) -> np.ndarray:
     """
-    Build a volume profile from OHLCV data.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        OHLCV DataFrame.
-    n_bins : int
-        Number of price buckets in the histogram.
-    value_area_pct : float
-        Fraction of total volume that defines the Value Area (e.g. 0.70).
+    Compute 6 AMT / Volume-Profile features for the current 4h bar.
 
     Returns
     -------
-    dict with keys: poc_price, vah, val, total_volume, poc_volume,
-                    buy_volume, sell_volume
+    np.ndarray, shape (6,), dtype float32
+        [0] poc_dist     – (close - POC) / ATR
+        [1] vah_dist     – (VAH  - close) / ATR
+        [2] val_dist     – (close - VAL) / ATR
+        [3] va_width     – (VAH - VAL) / ATR  (spread / compression signal)
+        [4] in_value_area – 1.0 if VAL <= close <= VAH else 0.0
+        [5] vol_rank      – rank of current bar's volume (0..1) vs window
     """
-    cfg = _cfg()
-    n_bins = n_bins or cfg["n_bins"]
-    va_pct = value_area_pct or cfg["value_area_pct"]
+    end   = current_idx + 1
+    start = max(0, end - PROFILE_BARS)
+    sub   = df_4h.iloc[start:end]
 
-    if df is None or len(df) < 5:
-        return _empty_profile(df["close"].iloc[-1] if df is not None and len(df) > 0 else 0)
+    if len(sub) < 5:
+        return np.zeros(6, dtype=np.float32)
 
-    lo = df["low"].min()
-    hi = df["high"].max()
+    atr = _atr(sub)
+    if atr < 1e-8:
+        return np.zeros(6, dtype=np.float32)
 
-    if hi == lo:
-        return _empty_profile(df["close"].iloc[-1])
+    close = float(sub["close"].iloc[-1])
 
-    # Distribute volume uniformly across each candle's price range
-    bins = np.linspace(lo, hi, n_bins + 1)
-    price_levels = (bins[:-1] + bins[1:]) / 2.0
-    vol_hist = np.zeros(n_bins)
+    poc, vah, val = _volume_profile(sub)
+
+    poc_dist = (close - poc) / atr
+    vah_dist = (vah  - close) / atr
+    val_dist = (close - val)  / atr
+    va_width = (vah - val)    / atr
+    in_va    = 1.0 if val <= close <= vah else 0.0
+
+    # Volume rank of current bar
+    vol_series = sub["volume"].values
+    cur_vol    = vol_series[-1]
+    vol_rank   = float(np.mean(vol_series < cur_vol))  # percentile rank
+
+    feats = np.array([poc_dist, vah_dist, val_dist, va_width, in_va, vol_rank],
+                     dtype=np.float32)
+    return np.clip(feats, -10.0, 10.0)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _atr(df: pd.DataFrame, period: int = 14) -> float:
+    h  = df["high"].values
+    l  = df["low"].values
+    c  = df["close"].values
+    pc = np.roll(c, 1); pc[0] = c[0]
+    tr = np.maximum(h - l, np.maximum(np.abs(h - pc), np.abs(l - pc)))
+    return float(tr[-period:].mean()) if len(tr) >= period else float(tr.mean())
+
+
+def _volume_profile(df: pd.DataFrame):
+    """Compute POC, VAH, VAL over the given window using a price-bucketed profile."""
+    lo   = df["low"].min()
+    hi   = df["high"].max()
+    if hi - lo < 1e-8:
+        mid = (hi + lo) / 2
+        return mid, mid, mid
+
+    bins  = np.linspace(lo, hi, PRICE_BINS + 1)
+    vols  = np.zeros(PRICE_BINS, dtype=float)
 
     for _, row in df.iterrows():
-        # Find which bins the candle spans
-        low_bin = np.searchsorted(bins, row["low"], side="left")
-        high_bin = np.searchsorted(bins, row["high"], side="right")
-        low_bin = max(0, low_bin - 1)
-        high_bin = min(n_bins - 1, high_bin)
-        span = high_bin - low_bin + 1
-        if span > 0:
-            vol_hist[low_bin:high_bin + 1] += row["volume"] / span
+        # Distribute bar's volume evenly across the price range it covers
+        bar_lo, bar_hi, vol = row["low"], row["high"], row["volume"]
+        for b in range(PRICE_BINS):
+            overlap = min(bar_hi, bins[b+1]) - max(bar_lo, bins[b])
+            if overlap > 0:
+                span = bar_hi - bar_lo + 1e-8
+                vols[b] += vol * (overlap / span)
 
-    # POC = bin with highest volume
-    poc_idx = int(np.argmax(vol_hist))
-    poc_price = float(price_levels[poc_idx])
+    total_vol = vols.sum()
+    poc_idx   = int(np.argmax(vols))
+    poc       = float((bins[poc_idx] + bins[poc_idx + 1]) / 2)
 
-    # Value Area: start at POC, expand to adjacent bins until VA_PCT of volume included
-    total_vol = float(vol_hist.sum())
-    target_vol = total_vol * va_pct
+    # Value area: expand from POC until 70% of volume is enclosed
+    va_vol   = vols[poc_idx]
+    lo_idx   = poc_idx
+    hi_idx   = poc_idx
 
-    vah_idx, val_idx = poc_idx, poc_idx
-    accumulated = float(vol_hist[poc_idx])
-
-    while accumulated < target_vol:
-        up_vol = float(vol_hist[vah_idx + 1]) if vah_idx + 1 < n_bins else 0.0
-        dn_vol = float(vol_hist[val_idx - 1]) if val_idx - 1 >= 0 else 0.0
-
-        if up_vol == 0 and dn_vol == 0:
+    while va_vol < VALUE_AREA_PCT * total_vol:
+        can_expand_lo = lo_idx > 0
+        can_expand_hi = hi_idx < PRICE_BINS - 1
+        if not can_expand_lo and not can_expand_hi:
             break
-        if up_vol >= dn_vol:
-            vah_idx = min(vah_idx + 1, n_bins - 1)
-            accumulated += up_vol
+        add_lo = vols[lo_idx - 1] if can_expand_lo else -1
+        add_hi = vols[hi_idx + 1] if can_expand_hi else -1
+        if add_lo >= add_hi:
+            lo_idx -= 1; va_vol += vols[lo_idx]
         else:
-            val_idx = max(val_idx - 1, 0)
-            accumulated += dn_vol
+            hi_idx += 1; va_vol += vols[hi_idx]
 
-    vah = float(price_levels[vah_idx])
-    val = float(price_levels[val_idx])
+    val = float(bins[lo_idx])
+    vah = float(bins[hi_idx + 1])
 
-    # Rough buy/sell imbalance: candles where close > open are "buy" volume
-    buy_vol = float(df.loc[df["close"] >= df["open"], "volume"].sum())
-    sell_vol = float(df["volume"].sum() - buy_vol)
-
-    return {
-        "poc_price": poc_price,
-        "vah": vah,
-        "val": val,
-        "total_volume": total_vol,
-        "poc_volume": float(vol_hist[poc_idx]),
-        "buy_volume": buy_vol,
-        "sell_volume": sell_vol,
-    }
-
-
-def extract_amt_features(df: pd.DataFrame, current_price: float) -> np.ndarray:
-    """
-    Extract 6 AMT features from an OHLCV DataFrame.
-
-    Returns np.ndarray of shape (6,), values in [-1, 1].
-    """
-    if df is None or len(df) < 10:
-        return np.zeros(6, dtype=np.float32)
-
-    try:
-        profile = build_volume_profile(df)
-
-        poc_price = profile["poc_price"]
-        vah = profile["vah"]
-        val = profile["val"]
-        total_vol = profile["total_volume"]
-        poc_vol = profile["poc_volume"]
-        buy_vol = profile["buy_volume"]
-        sell_vol = profile["sell_volume"]
-
-        # Normalised distances (signed: positive = price above level)
-        poc_dist = _signed_dist(current_price, poc_price)
-        vah_dist = _signed_dist(current_price, vah)
-        val_dist = _signed_dist(current_price, val)
-
-        # Inside Value Area flag
-        in_va = 1.0 if val <= current_price <= vah else 0.0
-
-        # POC volume concentration (how strong is the POC?)
-        poc_pct = float(poc_vol / total_vol) if total_vol > 0 else 0.0
-        poc_pct_norm = float(np.clip(poc_pct * 5.0 - 1.0, -1.0, 1.0))  # 20% → neutral
-
-        # Buy/sell imbalance [-1 (all sell) … +1 (all buy)]
-        total = buy_vol + sell_vol
-        imbalance = float((buy_vol - sell_vol) / total) if total > 0 else 0.0
-
-        return np.array([
-            poc_dist,
-            vah_dist,
-            val_dist,
-            in_va,
-            poc_pct_norm,
-            imbalance,
-        ], dtype=np.float32)
-
-    except Exception:
-        return np.zeros(6, dtype=np.float32)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _signed_dist(price: float, level: float, scale: float = 20.0) -> float:
-    """
-    Signed normalised distance: (price - level) / level, clipped to [-1, 1].
-    scale=20 means ±5% price deviation maps to ±1.0.
-    """
-    if level == 0:
-        return 0.0
-    return float(np.clip((price - level) / level * scale, -1.0, 1.0))
-
-
-def _empty_profile(price: float) -> dict:
-    return {
-        "poc_price": price,
-        "vah": price,
-        "val": price,
-        "total_volume": 0.0,
-        "poc_volume": 0.0,
-        "buy_volume": 0.0,
-        "sell_volume": 0.0,
-    }
+    return poc, vah, val

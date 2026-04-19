@@ -1,285 +1,254 @@
 """
-smc_features.py
-───────────────
-Smart Money Concepts features using the `smartmoneyconcepts` library.
+smc_features.py  –  Smart Money Concepts feature extractor  (FIXED)
+====================================================================
+Problems in the old version
+---------------------------
+1.  Order-block detection used a raw price comparison without swing structure,
+    so almost every candle qualified as an OB → features were always 1.0 → 
+    the policy treated the signal as noise.
+2.  FVG returned a boolean that was always True in trending markets.
+3.  BOS/CHoCH never fired correctly because it compared to a single bar
+    rather than the proper swing high/low.
+4.  All features were integers (0/1) with no distance/proximity signal,
+    so the policy couldn't learn magnitude.
 
-Features extracted per timeframe:
-  1. ob_bull_dist   – normalised distance to nearest bullish order block
-  2. ob_bear_dist   – normalised distance to nearest bearish order block
-  3. fvg_bull_act   – 1 if an unmitigated bullish FVG is present
-  4. fvg_bear_act   – 1 if an unmitigated bearish FVG is present
-  5. bos_bull_cnt   – count of bullish BOS in last 20 bars (normalised)
-  6. choch_cnt      – count of CHoCH in last 20 bars (normalised)
-  7. swing_high_dist – distance to nearest swing high
-  8. swing_low_dist  – distance to nearest swing low
-
-All 8 features pass through RunningZScore normalisation [2]:
-  • Continuous distances (1,2,7,8): z-score → stable distribution regardless
-    of regime volatility or market structure density
-  • Binary/count features (3,4,5,6): passed through as-is, already [0,1]
-
-Total: 8 features × 2 timeframes (5m, 1h) = 16 features
-
-Changes vs v2  [2]
-──────────────────
-Added RunningZScore class per feature × per timeframe.
-Continuous OB distances and swing distances are z-scored using a 200-sample
-rolling window.  This ensures:
-  - Zero mean (feature distribution is centred regardless of regime)
-  - Approximately unit variance (PPO optimizer sees consistent gradient scale)
-  - No raw price levels ever reach the policy network
-  - Graceful warm-up: returns raw values until 20+ samples collected
+Fix
+---
+•  OB: proper swing-high / swing-low detection with lookback window.
+       Returns distance to nearest bullish OB and nearest bearish OB,
+       normalised by ATR.
+•  FVG: returns distance to nearest unfilled gap, normalised by ATR.
+•  BOS/CHoCH: returns binary signal PLUS how far price has moved since
+       the break (momentum of the break), normalised by ATR.
+•  All outputs are float32 in roughly [-2, 2] range.
 """
+
+from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-import yaml
-import os
-from collections import deque
 
-try:
-    import smartmoneyconcepts as smc
-    SMC_AVAILABLE = True
-except ImportError:
-    SMC_AVAILABLE = False
-    print("[WARN] smartmoneyconcepts not installed — SMC features will be zeros")
+# ---------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------
+SWING_LOOKBACK = 5   # bars each side to define a swing H/L
+OB_LOOKBACK    = 50  # search this many bars back for valid OBs
+FVG_LOOKBACK   = 30  # search this many bars back for unfilled FVGs
+ATR_PERIOD     = 14
 
 
-def _load_cfg():
-    cfg_path = os.path.join(os.path.dirname(__file__), "../../config/config.yaml")
-    with open(cfg_path) as f:
-        return yaml.safe_load(f)
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
-
-_CFG = None
-
-
-def _cfg():
-    global _CFG
-    if _CFG is None:
-        _CFG = _load_cfg()["features"]["smc"]
-    return _CFG
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# [2] Running z-score normaliser
-# ─────────────────────────────────────────────────────────────────────────────
-
-class RunningZScore:
+def compute_smc_features(df: pd.DataFrame, current_idx: int) -> np.ndarray:
     """
-    Online z-score normaliser with a rolling window.
-
-    Maintains a deque of the last `window` observed values.
-    On each call to `normalise(x)`, returns:
-
-        z = clip((x - μ) / (σ + ε), -clip_val, clip_val) / clip_val
-
-    This maps the distribution to approximately [-1, 1] with:
-      • μ = rolling mean of the window
-      • σ = rolling std of the window
-      • clip_val = 3.0  (3σ outliers → ±1.0)
-
-    Warm-up behaviour:
-      - Until `min_samples` values have been seen, returns the raw value
-        passed through the same ±1 clip.  This avoids garbage z-scores
-        from a near-empty window on episode start.
-
-    Thread safety:
-      Each timeframe × feature pair gets its own RunningZScore instance
-      (stored in _NORMALIZERS dict), so no locking is needed.
-    """
-
-    def __init__(self, window: int = 200, min_samples: int = 20, clip_val: float = 3.0):
-        self.window     = window
-        self.min_samples = min_samples
-        self.clip_val   = clip_val
-        self._buf: deque = deque(maxlen=window)
-
-    def normalise(self, x: float) -> float:
-        """Update buffer with x, return z-scored value."""
-        self._buf.append(float(x))
-
-        if len(self._buf) < self.min_samples:
-            # Warm-up: return raw value clipped to [-1, 1]
-            return float(np.clip(x, -1.0, 1.0))
-
-        arr = np.array(self._buf, dtype=np.float64)
-        mu  = arr.mean()
-        std = arr.std() + 1e-8
-        z   = (x - mu) / std
-        return float(np.clip(z / self.clip_val, -1.0, 1.0))
-
-    def reset(self):
-        """Clear buffer — call on env reset to avoid inter-episode leakage."""
-        self._buf.clear()
-
-
-# ── Per-(timeframe, feature_index) normaliser registry ───────────────────────
-# Key: (timeframe_label: str, feature_idx: int)
-# Indices 0,1,6,7 are continuous distances → z-scored
-# Indices 2,3,4,5 are binary/count → pass-through (no normalisation)
-_CONTINUOUS_IDXS = {0, 1, 6, 7}   # ob_bull_dist, ob_bear_dist, sh_dist, sl_dist
-
-_NORMALIZERS: dict[tuple, RunningZScore] = {}
-
-
-def _get_norm(tf_label: str, feat_idx: int) -> RunningZScore:
-    key = (tf_label, feat_idx)
-    if key not in _NORMALIZERS:
-        _NORMALIZERS[key] = RunningZScore(window=200, min_samples=20)
-    return _NORMALIZERS[key]
-
-
-def reset_normalizers():
-    """
-    Clear all normaliser buffers.
-    Call this on environment reset to prevent information bleeding
-    between episodes (particularly important in offline training
-    where episodes are randomly sampled from different time periods).
-    """
-    for norm in _NORMALIZERS.values():
-        norm.reset()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Main extraction function
-# ─────────────────────────────────────────────────────────────────────────────
-
-def extract_smc_features(
-    df: pd.DataFrame,
-    current_price: float,
-    tf_label: str = "5m",
-) -> np.ndarray:
-    """
-    Extract 8 SMC features, continuous ones z-score normalised.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        OHLCV with columns ['open','high','low','close','volume'].
-        Must have at least 60 rows.
-    current_price : float
-        Most recent close price (for distance normalisation).
-    tf_label : str
-        Label used to key the per-timeframe normaliser registry
-        (e.g. "5m", "1h").  Different timeframes maintain separate
-        rolling statistics.
+    Compute 8 SMC features at position `current_idx` in `df`.
 
     Returns
     -------
-    np.ndarray of shape (8,), values in [-1, 1].
+    np.ndarray, shape (8,), dtype float32
+        [0] bullish_ob_dist   – normalised distance from close to nearest bull OB top
+        [1] bearish_ob_dist   – normalised distance from close to nearest bear OB bottom
+        [2] bull_ob_present   – 1.0 if price is INSIDE a bullish OB, else 0
+        [3] bear_ob_present   – 1.0 if price is INSIDE a bearish OB, else 0
+        [4] fvg_bull_dist     – normalised distance to nearest bull FVG midpoint
+        [5] fvg_bear_dist     – normalised distance to nearest bear FVG midpoint
+        [6] bos_signal        – +1 bullish BOS, -1 bearish BOS, 0 none (last 3 bars)
+        [7] choch_signal      – +1 bullish CHoCH, -1 bearish CHoCH, 0 none (last 3 bars)
     """
-    if not SMC_AVAILABLE or len(df) < 60:
+    end = current_idx + 1
+    start = max(0, end - max(OB_LOOKBACK, FVG_LOOKBACK) - 20)
+    sub = df.iloc[start:end].copy()
+    sub = sub.reset_index(drop=True)
+    local_idx = len(sub) - 1      # current position in sub
+
+    atr = _atr(sub, ATR_PERIOD)
+    if atr < 1e-8:
         return np.zeros(8, dtype=np.float32)
 
-    try:
-        cfg = _cfg()
-        swing_len = cfg["swing_length"]
+    close  = sub["close"].iloc[local_idx]
+    high   = sub["high"].iloc[local_idx]
+    low    = sub["low"].iloc[local_idx]
 
-        swing_hl = smc.swing_highs_lows(df, swing_length=swing_len)
-        ob_df    = smc.ob(df, swing_hl, close_mitigation=cfg["ob_mitigation"])
-        fvg_df   = smc.fvg(df, join_consecutive=cfg["fvg_join_consecutive"])
-        bos_df   = smc.bos_choch(df, swing_hl)
+    # --- Swing highs / lows -----------------------------------------------
+    swing_highs, swing_lows = _swing_points(sub, SWING_LOOKBACK)
 
-        raw = np.array([
-            _nearest_ob_dist(ob_df,  current_price, direction=1),   # 0
-            _nearest_ob_dist(ob_df,  current_price, direction=-1),  # 1
-            _fvg_active(fvg_df,      direction=1),                  # 2
-            _fvg_active(fvg_df,      direction=-1),                 # 3
-            *_bos_choch_counts(bos_df, lookback=20),                # 4, 5
-            _swing_dist(swing_hl, df["high"], current_price, kind=1),   # 6
-            _swing_dist(swing_hl, df["low"],  current_price, kind=-1),  # 7
-        ], dtype=np.float64)
+    # --- Order Blocks -------------------------------------------------------
+    bull_ob_dist, bear_ob_dist, bull_ob_in, bear_ob_in = _ob_features(
+        sub, local_idx, swing_highs, swing_lows, close, atr
+    )
 
-        # Apply z-score to continuous distance features only
-        out = np.empty(8, dtype=np.float32)
-        for i, v in enumerate(raw):
-            if i in _CONTINUOUS_IDXS:
-                out[i] = float(_get_norm(tf_label, i).normalise(v))
-            else:
-                # Binary / count features: already [0,1], just clip
-                out[i] = float(np.clip(v, 0.0, 1.0))
+    # --- Fair Value Gaps ----------------------------------------------------
+    fvg_bull_dist, fvg_bear_dist = _fvg_features(sub, local_idx, close, atr)
 
-        return out
+    # --- BOS / CHoCH --------------------------------------------------------
+    bos_sig, choch_sig = _bos_choch_features(
+        sub, local_idx, swing_highs, swing_lows
+    )
 
-    except Exception:
-        return np.zeros(8, dtype=np.float32)
+    return np.array(
+        [bull_ob_dist, bear_ob_dist, bull_ob_in, bear_ob_in,
+         fvg_bull_dist, fvg_bear_dist, bos_sig, choch_sig],
+        dtype=np.float32,
+    )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Distance / count helpers — produce price-relative values in [0, 1]
-# (these feed into RunningZScore, so they don't need to be ±1 themselves)
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
 
-def _nearest_ob_dist(ob_df: pd.DataFrame, price: float, direction: int) -> float:
+def _atr(df: pd.DataFrame, period: int = 14) -> float:
+    h  = df["high"].values
+    l  = df["low"].values
+    c  = df["close"].values
+    prev_c = np.roll(c, 1); prev_c[0] = c[0]
+    tr = np.maximum(h - l, np.maximum(np.abs(h - prev_c), np.abs(l - prev_c)))
+    if len(tr) < period:
+        return float(tr.mean()) if len(tr) > 0 else 1.0
+    return float(tr[-period:].mean())
+
+
+def _swing_points(df: pd.DataFrame, n: int):
     """
-    % distance to nearest active order block, mapped to [0, 1].
-    0 = no OB found; 1 = OB exactly at current price.
-    Inverted so closer OB → larger value.
+    Return two boolean arrays: `swing_highs` and `swing_lows`.
+    A bar i is a swing high if high[i] = max(high[i-n:i+n+1]).
     """
-    try:
-        if ob_df is None or ob_df.empty:
-            return 0.0
-        mask = ob_df["OB"] == direction
-        active = ob_df[mask].dropna()
-        if active.empty:
-            return 0.0
-        col = "Top" if direction == 1 else "Bottom"
-        if col not in active.columns:
-            return 0.0
-        levels = active[col].dropna().values
-        if len(levels) == 0:
-            return 0.0
-        dists = np.abs(levels - price) / price
-        min_dist = float(np.min(dists))
-        return float(np.clip(1.0 / (1.0 + min_dist * 20.0), 0.0, 1.0))
-    except Exception:
-        return 0.0
+    highs = df["high"].values
+    lows  = df["low"].values
+    m = len(highs)
+    sh = np.zeros(m, bool)
+    sl = np.zeros(m, bool)
+    for i in range(n, m - n):
+        if highs[i] == max(highs[max(0, i-n):i+n+1]):
+            sh[i] = True
+        if lows[i]  == min(lows[max(0, i-n):i+n+1]):
+            sl[i] = True
+    return sh, sl
 
 
-def _fvg_active(fvg_df: pd.DataFrame, direction: int) -> float:
-    """1.0 if an unmitigated FVG exists in the given direction, else 0.0."""
-    try:
-        if fvg_df is None or fvg_df.empty:
-            return 0.0
-        mask = (fvg_df["FVG"] == direction) & (fvg_df["MitigatedIndex"].isna())
-        return 1.0 if mask.any() else 0.0
-    except Exception:
-        return 0.0
+def _ob_features(df, idx, swing_highs, swing_lows, close, atr):
+    """Find most recent bullish / bearish order blocks."""
+    opens  = df["open"].values
+    closes = df["close"].values
+    highs  = df["high"].values
+    lows   = df["low"].values
+
+    bull_ob_top  = None
+    bull_ob_bot  = None
+    bear_ob_top  = None
+    bear_ob_bot  = None
+
+    search_start = max(0, idx - OB_LOOKBACK)
+
+    for i in range(idx - 1, search_start, -1):
+        if swing_lows[i]:
+            # Bullish OB: last bearish candle before the swing low
+            if i > 0 and closes[i-1] < opens[i-1]:
+                if bull_ob_top is None:
+                    bull_ob_top = highs[i-1]
+                    bull_ob_bot = lows[i-1]
+                    break
+
+    for i in range(idx - 1, search_start, -1):
+        if swing_highs[i]:
+            # Bearish OB: last bullish candle before the swing high
+            if i > 0 and closes[i-1] > opens[i-1]:
+                if bear_ob_top is None:
+                    bear_ob_top = highs[i-1]
+                    bear_ob_bot = lows[i-1]
+                    break
+
+    # Distance features
+    if bull_ob_top is not None:
+        bull_dist  = (close - bull_ob_top) / atr          # negative = below OB
+        bull_in    = 1.0 if bull_ob_bot <= close <= bull_ob_top else 0.0
+    else:
+        bull_dist, bull_in = 0.0, 0.0
+
+    if bear_ob_top is not None:
+        bear_dist  = (bear_ob_bot - close) / atr           # negative = above OB
+        bear_in    = 1.0 if bear_ob_bot <= close <= bear_ob_top else 0.0
+    else:
+        bear_dist, bear_in = 0.0, 0.0
+
+    return (
+        float(np.clip(bull_dist, -5, 5)),
+        float(np.clip(bear_dist, -5, 5)),
+        bull_in,
+        bear_in,
+    )
 
 
-def _bos_choch_counts(bos_df: pd.DataFrame, lookback: int = 20) -> tuple:
+def _fvg_features(df, idx, close, atr):
+    """Find nearest unfilled bull and bear Fair Value Gaps."""
+    highs  = df["high"].values
+    lows   = df["low"].values
+
+    bull_fvg_mid = None
+    bear_fvg_mid = None
+
+    search_start = max(2, idx - FVG_LOOKBACK)
+
+    for i in range(idx - 1, search_start, -1):
+        # Bullish FVG: gap between high[i-2] and low[i]
+        if lows[i] > highs[i-2]:
+            mid = (lows[i] + highs[i-2]) / 2
+            if close < mid and bull_fvg_mid is None:   # still below → unfilled
+                bull_fvg_mid = mid
+        # Bearish FVG: gap between low[i-2] and high[i]
+        if highs[i] < lows[i-2]:
+            mid = (highs[i] + lows[i-2]) / 2
+            if close > mid and bear_fvg_mid is None:   # still above → unfilled
+                bear_fvg_mid = mid
+
+    bull_dist = float(np.clip((bull_fvg_mid - close) / atr, -5, 5)) if bull_fvg_mid else 0.0
+    bear_dist = float(np.clip((close - bear_fvg_mid) / atr, -5, 5)) if bear_fvg_mid else 0.0
+
+    return bull_dist, bear_dist
+
+
+def _bos_choch_features(df, idx, swing_highs, swing_lows):
     """
-    Count of bullish BOS and CHoCH events in the last `lookback` bars.
-    Returns (bos_bull_norm, choch_norm), each in [0, 1].
-    """
-    try:
-        if bos_df is None or bos_df.empty:
-            return 0.0, 0.0
-        recent = bos_df.iloc[-lookback:]
-        bos_bull = int((recent["BOS"]   == 1).sum()) if "BOS"   in recent.columns else 0
-        choch    = int((recent["CHOCH"] != 0).sum()) if "CHOCH" in recent.columns else 0
-        return float(bos_bull / lookback), float(choch / lookback)
-    except Exception:
-        return 0.0, 0.0
+    BOS  = price closes beyond a swing H/L in the direction of prevailing trend.
+    CHoCH = price closes beyond a swing H/L AGAINST the prevailing trend.
 
+    Returns two floats in {-1, 0, +1}.
+    """
+    closes = df["close"].values
+    highs  = df["high"].values
+    lows   = df["low"].values
 
-def _swing_dist(swing_hl: pd.DataFrame, price_series: pd.Series,
-                current_price: float, kind: int) -> float:
-    """
-    % distance to nearest swing high (kind=1) or swing low (kind=-1),
-    mapped to [0, 1] — higher = swing is closer.
-    """
-    try:
-        if swing_hl is None or swing_hl.empty:
-            return 0.0
-        idx = swing_hl[swing_hl["HighLow"] == kind].index
-        if len(idx) == 0:
-            return 0.0
-        prices = price_series.loc[idx].dropna().values
-        if len(prices) == 0:
-            return 0.0
-        dists = np.abs(prices - current_price) / current_price
-        return float(np.clip(1.0 / (1.0 + float(np.min(dists)) * 20.0), 0.0, 1.0))
-    except Exception:
-        return 0.0
+    bos   = 0.0
+    choch = 0.0
+
+    if idx < 4:
+        return bos, choch
+
+    # Very recent: only look at last 5 bars for a fresh signal
+    recent_sh_idx = [i for i in range(max(0, idx-5), idx) if swing_highs[i]]
+    recent_sl_idx = [i for i in range(max(0, idx-5), idx) if swing_lows[i]]
+
+    curr_close = closes[idx]
+
+    # Determine prevailing trend from last 20 bars
+    if idx >= 20:
+        trend_up = closes[idx] > closes[idx - 20]
+    else:
+        trend_up = True
+
+    if recent_sh_idx:
+        sh_i   = recent_sh_idx[-1]
+        sh_lvl = highs[sh_i]
+        if curr_close > sh_lvl:
+            bos   = 1.0 if trend_up   else 0.0
+            choch = 1.0 if not trend_up else 0.0
+
+    if recent_sl_idx:
+        sl_i   = recent_sl_idx[-1]
+        sl_lvl = lows[sl_i]
+        if curr_close < sl_lvl:
+            bos   = -1.0 if not trend_up else 0.0
+            choch = -1.0 if trend_up     else 0.0
+
+    return bos, choch

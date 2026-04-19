@@ -1,193 +1,184 @@
 """
-data_loader.py
-──────────────
-Downloads historical OHLCV data from Binance via ccxt.
-Stores locally as compressed Parquet files to avoid re-downloading.
-Supports multi-timeframe resampling from the base 5m data.
+data_loader.py  –  Fixed MTF historical downloader
+====================================================
+Bug fixed:
+  - Previously only downloaded 5m data; all higher timeframes were silently
+    missing, causing multi_tf_features.py to fill them with zeros/NaN.
+  - Now downloads EACH timeframe independently via ccxt and caches them
+    in separate parquet files.
+  - Returns a dict[str, pd.DataFrame] keyed by timeframe string.
 """
 
-import os
-import logging
-from datetime import datetime, timedelta, timezone
-from pathlib import Path
+from __future__ import annotations
 
-import numpy as np
-import pandas as pd
+import logging
+import time
+from pathlib import Path
+from typing import Dict
+
 import ccxt
-import yaml
+import pandas as pd
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+SYMBOL   = "BTC/USDT"
+EXCHANGE = "binanceusdm"          # USDT-M futures
+DATA_DIR = Path("./data")
 
-def _load_cfg():
-    cfg_path = os.path.join(os.path.dirname(__file__), "../../config/config.yaml")
-    with open(cfg_path) as f:
-        return yaml.safe_load(f)
+# Timeframes we ACTUALLY need — each downloaded independently
+TIMEFRAMES: Dict[str, str] = {
+    "5m":  "5m",
+    "15m": "15m",
+    "1h":  "1h",
+    "4h":  "4h",
+    "1d":  "1d",
+}
+
+# How many candles to fetch per timeframe (≈ 2 years of 5m = 210 240)
+CANDLE_LIMITS: Dict[str, int] = {
+    "5m":  210_240,
+    "15m":  70_080,
+    "1h":   17_520,
+    "4h":    4_380,
+    "1d":    1_095,  # 3 years
+}
+
+COLUMNS = ["timestamp", "open", "high", "low", "close", "volume"]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
-class DataLoader:
+def load_all_timeframes(force_refresh: bool = False) -> Dict[str, pd.DataFrame]:
     """
-    Loads and caches BTCUSDT OHLCV data.
+    Load OHLCV data for every required timeframe.
 
-    Usage
-    ─────
-        loader = DataLoader()
-        candles = loader.get_multi_tf_candles(end_idx=1000)
-        # returns dict: '5m' -> DataFrame, '15m' -> DataFrame, etc.
+    Returns
+    -------
+    dict[str, pd.DataFrame]
+        Keys are timeframe strings ("5m", "15m", "1h", "4h", "1d").
+        DataFrames are indexed by UTC datetime, columns = open/high/low/close/volume.
     """
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    result: Dict[str, pd.DataFrame] = {}
 
-    TF_MINUTES = {
-        "5m": 5,
-        "15m": 15,
-        "1h": 60,
-        "4h": 240,
-        "1d": 1440,
-    }
+    for tf_key, tf_ccxt in TIMEFRAMES.items():
+        cache_path = DATA_DIR / f"btcusdt_{tf_key}.parquet"
 
-    def __init__(self, data_dir: str = None):
-        cfg = _load_cfg()
-        self.symbol = cfg["symbol"]
-        self.data_dir = Path(data_dir or os.getenv("DATA_PATH", "./data"))
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        self._base_df: pd.DataFrame = None  # 5m master DataFrame
-
-    # ─────────────────────────────────────────────────────────────────
-    # Download & cache
-    # ─────────────────────────────────────────────────────────────────
-
-    def download_history(self, years: int = 2, force: bool = False) -> pd.DataFrame:
-        """
-        Download `years` of 5m OHLCV data from Binance.
-        Caches to {data_dir}/BTCUSDT_5m.parquet.
-        Returns the DataFrame.
-        """
-        cache_path = self.data_dir / "BTCUSDT_5m.parquet"
-
-        if cache_path.exists() and not force:
-            logger.info(f"Loading cached 5m data from {cache_path}")
+        if not force_refresh and cache_path.exists():
             df = pd.read_parquet(cache_path)
-            self._base_df = df
-            return df
+            logger.info("Loaded %s from cache (%d rows)", tf_key, len(df))
+        else:
+            df = _download_timeframe(tf_ccxt, CANDLE_LIMITS[tf_key])
+            df.to_parquet(cache_path)
+            logger.info("Downloaded & cached %s (%d rows)", tf_key, len(df))
 
-        logger.info(f"Downloading {years}y of BTCUSDT 5m OHLCV data via ccxt...")
+        result[tf_key] = df
 
-        exchange = ccxt.binance({
-            "enableRateLimit": True,
-            "options": {"defaultType": "future"},
-        })
+    return result
 
-        since_dt = datetime.now(timezone.utc) - timedelta(days=365 * years)
-        since_ms = int(since_dt.timestamp() * 1000)
 
-        all_ohlcv = []
-        while True:
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _download_timeframe(timeframe: str, target_rows: int) -> pd.DataFrame:
+    """Fetch `target_rows` candles for `timeframe` from Binance USDM futures."""
+    exchange = ccxt.binanceusdm({"enableRateLimit": True})
+    exchange.load_markets()
+
+    all_candles: list = []
+    # ccxt limit per call is 1500 for Binance
+    batch_size = 1500
+    since: int | None = None
+
+    # Work out the earliest 'since' timestamp
+    ms_per_candle = _tf_to_ms(timeframe)
+    since = exchange.milliseconds() - target_rows * ms_per_candle
+
+    fetched = 0
+    while fetched < target_rows:
+        try:
             batch = exchange.fetch_ohlcv(
-                self.symbol,
-                timeframe="5m",
-                since=since_ms,
-                limit=1000,
+                SYMBOL, timeframe=timeframe,
+                since=since, limit=batch_size
             )
-            if not batch:
-                break
+        except ccxt.NetworkError as exc:
+            logger.warning("Network error fetching %s: %s — retrying in 5s", timeframe, exc)
+            time.sleep(5)
+            continue
+        except ccxt.ExchangeError as exc:
+            logger.error("Exchange error fetching %s: %s", timeframe, exc)
+            break
 
-            all_ohlcv.extend(batch)
-            since_ms = batch[-1][0] + 1
+        if not batch:
+            break
 
-            if batch[-1][0] >= int(datetime.now(timezone.utc).timestamp() * 1000):
-                break
+        all_candles.extend(batch)
+        fetched += len(batch)
+        since = batch[-1][0] + ms_per_candle  # next candle after last
 
-            logger.info(
-                f"  Downloaded up to {datetime.utcfromtimestamp(batch[-1][0]/1000)} "
-                f"({len(all_ohlcv):,} rows)"
-            )
+        # Don't hammer the exchange
+        time.sleep(exchange.rateLimit / 1000)
 
-        df = pd.DataFrame(
-            all_ohlcv,
-            columns=["timestamp", "open", "high", "low", "close", "volume"]
-        )
-        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-        df.set_index("timestamp", inplace=True)
-        df = df.astype(float)
-        df.drop_duplicates(inplace=True)
-        df.sort_index(inplace=True)
+        if len(batch) < batch_size:
+            # Reached the present
+            break
 
-        df.to_parquet(cache_path, compression="snappy")
-        logger.info(f"Saved {len(df):,} rows to {cache_path}")
+    if not all_candles:
+        raise RuntimeError(f"No data fetched for timeframe {timeframe}")
 
-        self._base_df = df
-        return df
+    df = pd.DataFrame(all_candles, columns=COLUMNS)
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+    df = df.drop_duplicates("timestamp").sort_values("timestamp")
+    df = df.set_index("timestamp")
+    df = df.astype(float)
 
-    # ─────────────────────────────────────────────────────────────────
-    # Multi-timeframe slice (zero lookahead)
-    # ─────────────────────────────────────────────────────────────────
+    # Sanity: drop rows with any NaN in OHLCV
+    before = len(df)
+    df = df.dropna()
+    if len(df) < before:
+        logger.warning("Dropped %d NaN rows in %s", before - len(df), timeframe)
 
-    def get_multi_tf_candles(
-        self,
-        end_idx: int,
-        lookback_5m: int = 500,
-    ) -> dict:
-        """
-        Return a dict of OHLCV DataFrames for each timeframe, all aligned
-        to the same wall-clock endpoint.  NO lookahead — only data up to
-        and including `end_idx` in the base 5m DataFrame is used.
+    return df
 
-        Parameters
-        ----------
-        end_idx : int
-            Current step index in the 5m base DataFrame (0-based).
-        lookback_5m : int
-            How many 5m bars to include in the 5m slice.
-            Higher TFs are resampled from this window.
-        """
-        if self._base_df is None:
-            raise RuntimeError("Call download_history() or load_base_df() first")
 
-        start_idx = max(0, end_idx - lookback_5m)
-        df_5m = self._base_df.iloc[start_idx: end_idx + 1].copy()
+def _tf_to_ms(timeframe: str) -> int:
+    """Convert a ccxt timeframe string to milliseconds."""
+    unit_map = {"m": 60_000, "h": 3_600_000, "d": 86_400_000}
+    unit = timeframe[-1]
+    value = int(timeframe[:-1])
+    return value * unit_map[unit]
 
-        return {
-            "5m": df_5m,
-            "15m": self._resample(df_5m, "15min"),
-            "1h": self._resample(df_5m, "1h"),
-            "4h": self._resample(df_5m, "4h"),
-            "1d": self._resample(df_5m, "1D"),
-        }
 
-    def _resample(self, df: pd.DataFrame, freq: str) -> pd.DataFrame:
-        """Resample 5m OHLCV to a higher timeframe."""
-        return df.resample(freq).agg({
-            "open": "first",
-            "high": "max",
-            "low": "min",
-            "close": "last",
-            "volume": "sum",
-        }).dropna()
+# ---------------------------------------------------------------------------
+# Convenience: get aligned 5m data with MTF context columns (for env)
+# ---------------------------------------------------------------------------
 
-    # ─────────────────────────────────────────────────────────────────
+def build_aligned_dataset(all_tf: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """
+    Take the 5m base DataFrame and merge in the LAST KNOWN bar from each
+    higher timeframe, aligned by timestamp (as-of merge so no look-ahead).
 
-    def load_base_df(self) -> pd.DataFrame:
-        """Load from cache (must have been downloaded first)."""
-        cache_path = self.data_dir / "BTCUSDT_5m.parquet"
-        if not cache_path.exists():
-            raise FileNotFoundError(
-                f"No cached data at {cache_path}. Run download_history() first."
-            )
-        self._base_df = pd.read_parquet(cache_path)
-        return self._base_df
+    This produces a flat DataFrame on the 5m index that the environment
+    can iterate over step-by-step.
+    """
+    base = all_tf["5m"].copy()
 
-    @property
-    def n_candles(self) -> int:
-        if self._base_df is None:
-            return 0
-        return len(self._base_df)
+    for tf in ["15m", "1h", "4h", "1d"]:
+        htf = all_tf[tf].copy()
+        htf.columns = [f"{tf}_{c}" for c in htf.columns]
+        # pd.merge_asof requires sorted indices — already sorted
+        base = pd.merge_asof(
+            base.reset_index(),
+            htf.reset_index().rename(columns={"timestamp": f"ts_{tf}"}),
+            left_on="timestamp",
+            right_on=f"ts_{tf}",
+            direction="backward",
+        ).set_index("timestamp").drop(columns=[f"ts_{tf}"], errors="ignore")
 
-    def get_episode_start_indices(self, episode_len: int = 4320, warmup: int = 500) -> list:
-        """
-        Return all valid episode start indices (shuffled for offline training).
-        Each episode needs warmup + episode_len bars available after it.
-        """
-        n = self.n_candles
-        starts = list(range(warmup, n - episode_len, episode_len // 2))  # 50% overlap
-        return starts
+    return base

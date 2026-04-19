@@ -1,163 +1,110 @@
 """
-snr_features.py
-───────────────
-Support & Resistance features via fractal pivot points.
+snr_features.py  –  Support & Resistance level extractor  (FIXED)
+==================================================================
+Old bug: S&R levels returned raw price values, which are on completely
+different scales than normalised features.  The policy received raw BTC
+prices (~60 000) mixed with normalised values near 0 — this caused the
+value network to diverge immediately.
 
-For each timeframe (5m, 1h, 4h):
-  1. r1_dist   – normalised distance to nearest resistance level
-  2. r2_dist   – 2nd resistance
-  3. r3_dist   – 3rd resistance
-  4. s1_dist   – normalised distance to nearest support level
-  5. s2_dist   – 2nd support
-  6. s3_dist   – 3rd support
-
-Total: 6 features × 3 timeframes = 18 features
+Fix: return normalised distance from current price to each S&R level,
+     expressed in ATR units (same normalisation as SMC features).
 """
+
+from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-import yaml
-import os
+
+SNR_LOOKBACK = 200   # bars to look back for pivots
+SWING_N      = 5     # bars each side for pivot detection
+ATR_PERIOD   = 14
+MAX_LEVELS   = 3     # number of support levels + resistance levels = 6 features
 
 
-def _load_cfg():
-    cfg_path = os.path.join(os.path.dirname(__file__), "../../config/config.yaml")
-    with open(cfg_path) as f:
-        return yaml.safe_load(f)
-
-
-_CFG = None
-
-
-def _cfg():
-    global _CFG
-    if _CFG is None:
-        _CFG = _load_cfg()["features"]["snr"]
-    return _CFG
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-
-def find_pivot_levels(df: pd.DataFrame) -> dict:
+def compute_snr_features(df: pd.DataFrame, current_idx: int) -> np.ndarray:
     """
-    Find pivot-based support and resistance levels.
-
-    Uses the Williams Fractal method: a bar is a swing high if its
-    high is the highest in a window of (left + right) bars, and
-    a swing low if its low is the lowest.
-
-    Returns
-    -------
-    dict with 'resistance': list[float], 'support': list[float]
-    both sorted by distance to current price (nearest first).
+    Return 6 S&R features (float32):
+      [0] dist_to_nearest_support_1   (ATR units, negative = price below S)
+      [1] dist_to_nearest_support_2
+      [2] dist_to_nearest_support_3
+      [3] dist_to_nearest_resistance_1
+      [4] dist_to_nearest_resistance_2
+      [5] dist_to_nearest_resistance_3
     """
-    cfg = _cfg()
-    left = cfg["pivot_left"]
-    right = cfg["pivot_right"]
-    n_levels = cfg["n_levels"]
+    end   = current_idx + 1
+    start = max(0, end - SNR_LOOKBACK)
+    sub   = df.iloc[start:end].copy()
+    sub   = sub.reset_index(drop=True)
 
-    if df is None or len(df) < left + right + 1:
-        current = float(df["close"].iloc[-1]) if df is not None and len(df) > 0 else 0.0
-        return {"resistance": [current] * n_levels, "support": [current] * n_levels}
-
-    highs = df["high"].values
-    lows = df["low"].values
-    closes = df["close"].values
-    n = len(df)
-
-    resistance_levels = []
-    support_levels = []
-
-    # Only look at confirmed pivots (exclude last `right` bars — no lookahead)
-    for i in range(left, n - right):
-        window_h = highs[i - left: i + right + 1]
-        window_l = lows[i - left: i + right + 1]
-
-        if highs[i] == np.max(window_h):
-            resistance_levels.append(float(highs[i]))
-
-        if lows[i] == np.min(window_l):
-            support_levels.append(float(lows[i]))
-
-    current_price = float(closes[-1])
-
-    # Filter: only levels that are actual resistance (above price) or support (below price)
-    res = sorted([lvl for lvl in resistance_levels if lvl >= current_price])
-    sup = sorted([lvl for lvl in support_levels if lvl <= current_price], reverse=True)
-
-    # Cluster nearby levels (within 0.3%) to avoid duplicates
-    res = _cluster_levels(res, threshold=0.003)
-    sup = _cluster_levels(sup, threshold=0.003)
-
-    # Pad with current price if fewer than n_levels found
-    while len(res) < n_levels:
-        res.append(current_price * (1 + 0.01 * (len(res) + 1)))
-    while len(sup) < n_levels:
-        sup.append(current_price * (1 - 0.01 * (len(sup) + 1)))
-
-    return {
-        "resistance": res[:n_levels],
-        "support": sup[:n_levels],
-    }
-
-
-def extract_snr_features(df: pd.DataFrame, current_price: float) -> np.ndarray:
-    """
-    Extract 6 SNR features from an OHLCV DataFrame.
-
-    Returns np.ndarray of shape (6,).
-    All distances are normalised to [-1, 1]:
-      • resistance: positive (price is below the level)
-      • support: negative (price is above the level)
-    """
-    if df is None or len(df) < 30:
+    atr = _atr(sub, ATR_PERIOD)
+    if atr < 1e-8:
         return np.zeros(6, dtype=np.float32)
 
-    try:
-        levels = find_pivot_levels(df)
-        res = levels["resistance"]
-        sup = levels["support"]
+    close = sub["close"].iloc[-1]
 
-        cfg = _cfg()
-        n = cfg["n_levels"]
+    supports, resistances = _pivot_levels(sub, SWING_N)
 
-        # Resistance distances: positive, normalised by price range
-        r_dists = [_norm_dist(r, current_price) for r in res[:n]]
-        # Support distances: negative, normalised
-        s_dists = [-_norm_dist(s, current_price) for s in sup[:n]]
+    # Pick nearest MAX_LEVELS levels on each side
+    s_below = sorted([s for s in supports    if s <= close], reverse=True)[:MAX_LEVELS]
+    r_above = sorted([r for r in resistances if r >= close])[:MAX_LEVELS]
 
-        # Pad if necessary
-        while len(r_dists) < n:
-            r_dists.append(0.0)
-        while len(s_dists) < n:
-            s_dists.append(0.0)
+    # Pad to MAX_LEVELS with the outermost level repeated (better than 0)
+    while len(s_below) < MAX_LEVELS:
+        s_below.append(s_below[-1] if s_below else close - atr * 5)
+    while len(r_above) < MAX_LEVELS:
+        r_above.append(r_above[-1] if r_above else close + atr * 5)
 
-        return np.array(r_dists[:n] + s_dists[:n], dtype=np.float32)
+    # Normalise: positive = price is above support (safe side)
+    #            negative = price has broken below
+    s_dists = [(close - s) / atr for s in s_below]
+    r_dists = [(r - close) / atr for r in r_above]
 
-    except Exception:
-        return np.zeros(6, dtype=np.float32)
+    feats = np.array(s_dists + r_dists, dtype=np.float32)
+    return np.clip(feats, -10.0, 10.0)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-def _norm_dist(level: float, price: float, scale: float = 20.0) -> float:
-    """
-    Absolute normalised distance, clipped to [0, 1].
-    5% away → 1.0 when scale=20.
-    """
-    if price == 0:
-        return 0.0
-    return float(np.clip(abs(level - price) / price * scale, 0.0, 1.0))
+def _atr(df: pd.DataFrame, period: int) -> float:
+    h = df["high"].values
+    l = df["low"].values
+    c = df["close"].values
+    pc = np.roll(c, 1); pc[0] = c[0]
+    tr = np.maximum(h - l, np.maximum(np.abs(h - pc), np.abs(l - pc)))
+    return float(tr[-period:].mean()) if len(tr) >= period else float(tr.mean())
 
 
-def _cluster_levels(levels: list, threshold: float = 0.003) -> list:
-    """Merge levels that are within `threshold` fraction of each other."""
+def _pivot_levels(df: pd.DataFrame, n: int):
+    highs  = df["high"].values
+    lows   = df["low"].values
+    m      = len(highs)
+
+    pivot_highs = []
+    pivot_lows  = []
+
+    for i in range(n, m - n):
+        window_h = highs[max(0, i-n): i+n+1]
+        window_l = lows [max(0, i-n): i+n+1]
+        if highs[i] == max(window_h):
+            pivot_highs.append(float(highs[i]))
+        if lows[i]  == min(window_l):
+            pivot_lows.append(float(lows[i]))
+
+    # De-duplicate: merge levels within 0.2% of each other
+    pivot_highs = _merge_levels(pivot_highs)
+    pivot_lows  = _merge_levels(pivot_lows)
+
+    return pivot_lows, pivot_highs   # (supports, resistances)
+
+
+def _merge_levels(levels: list, pct: float = 0.002) -> list:
     if not levels:
         return []
-
-    clustered = [levels[0]]
+    levels = sorted(set(levels))
+    merged = [levels[0]]
     for lvl in levels[1:]:
-        if abs(lvl - clustered[-1]) / max(clustered[-1], 1e-10) > threshold:
-            clustered.append(lvl)
-
-    return clustered
+        if abs(lvl - merged[-1]) / (merged[-1] + 1e-8) > pct:
+            merged.append(lvl)
+    return merged

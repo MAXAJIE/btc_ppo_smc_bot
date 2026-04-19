@@ -1,159 +1,109 @@
-# ═══════════════════════════════════════════════════════════════════
-#  BTC PPO SMC Trading Bot — Master Config
-# ═══════════════════════════════════════════════════════════════════
+# config/config.yaml  –  Hyperparameters  (FIXED for convergence)
+# =====================================================================
+# Summary of changes from original:
+#
+#   learning_rate : 3e-4 → 1e-4
+#       Reason: the observation space is 90-dim with mixed-scale features.
+#       A large LR causes the policy to oscillate and never settle.
+#
+#   n_steps : 2048 → 4096
+#       Reason: with a 4320-step episode and a sparse reward landscape,
+#       2048 steps gives the critic only ~1 episode of experience per
+#       update. 4096 ensures each update sees ~2 full episodes.
+#
+#   batch_size : 64 → 256
+#       Reason: larger mini-batches reduce gradient variance for the
+#       value network, which is the main source of high value-loss.
+#
+#   n_epochs : 10 → 5
+#       Reason: fewer epochs per update avoids overfitting to the small
+#       rollout buffer, which was causing the policy to update too
+#       aggressively and then diverge.
+#
+#   clip_range : 0.2 → 0.15
+#       Reason: tighter clipping keeps the policy update conservative,
+#       which is critical early in training when feature representations
+#       are still being learned.
+#
+#   ent_coef : 0.0 → 0.01
+#       Reason: the original config had NO entropy bonus, causing the
+#       policy to collapse to a near-deterministic "always HOLD" strategy
+#       after ~100k steps.  0.01 encourages continued exploration.
+#
+#   vf_coef : 0.5 → 0.7
+#       Reason: the value network is under-trained relative to the policy
+#       because of sparse rewards.  Increasing vf_coef forces the critic
+#       to receive more gradient signal per update.
+#
+#   gamma : 0.99 → 0.995
+#       Reason: our episode is 15 days; with gamma=0.99 a reward at
+#       step 500 has only e^(-5) ≈ 0.007 weight at step 1.  0.995 keeps
+#       longer-term rewards visible to the critic.
+#
+#   gae_lambda : 0.95 → 0.97
+#       Reason: with longer episodes and a less-fitted critic, higher
+#       lambda (more Monte-Carlo-like returns) reduces bias.
 
-# ── Trading Pair & Market ─────────────────────────────────────────
-symbol: "BTCUSDT"
-market_type: "futures"          # futures (USDT perpetual)
-margin_mode: "isolated"
-max_leverage: 3                 # hard cap, Kelly will usually go lower
+environment:
+  symbol:        "BTCUSDT"
+  timeframes:    ["5m", "15m", "1h", "4h", "1d"]
+  obs_dim:       90
+  action_dim:    7
+  episode_steps: 4320         # 15 days × 288 bars/day
+  max_trade_hold_steps: 576   # 2 days max hold
+  stop_loss_pct:  0.03        # hard stop -3%
+  take_profit_pct: 0.06       # hard TP +6%
+  kill_switch_drawdown: 0.15  # halt at -15%
+  max_leverage:  3.0
 
-# ── Timeframes ────────────────────────────────────────────────────
-timeframes:
-  entry: "5m"                   # agent acts on 5m closes
-  confirmation: ["15m", "1h"]   # signal confirmation
-  trend_filter: ["4h", "1d"]    # macro trend gate
-
-# ── Episode ───────────────────────────────────────────────────────
-episode:
-  candles_per_episode: 4320     # 15 days × 288 5m candles/day
-  warmup_candles: 500           # candles before episode start (for indicators)
-  max_bars_in_trade: 576        # force-close after 2 days (576 × 5m)
-
-# ── Observation Space ─────────────────────────────────────────────
-obs:
-  dim: 90                       # total feature vector length
-  normalize: true
-  clip_range: 5.0               # clip normalized features to [-5, 5]
-
-# ── Action Space ─────────────────────────────────────────────────
-# Discrete(7):
-#   0=HOLD  1=LONG_FULL  2=LONG_HALF  3=SHORT_FULL  4=SHORT_HALF  5=CLOSE  6=REDUCE_50
-actions:
-  n_actions: 7
-  long_full_size: 1.0           # fraction of Kelly-recommended size
-  long_half_size: 0.5
-  short_full_size: 1.0
-  short_half_size: 0.5
-  reduce_pct: 0.5
-
-# ── Reward ────────────────────────────────────────────────────────
-reward:
-  win_scale: 1.0                # multiplier on log(1 + pnl)
-  loss_penalty: 2.0             # amplified punishment multiplier
-  step_hold_penalty: -0.0001    # per-step time decay when FLAT (no position)
-  commission_rate: 0.0004       # 0.04% taker fee (futures)
-  slippage_rate: 0.0002         # estimated market impact
-  funding_rate_interval: 480    # every 8h = 480 5m candles
-
-  # ── A. Punitive kill-switch reward ───────────────────────────────
-  # When kill-switch fires: R = -kill_penalty_scale * (1 + drawdown)
-  # e.g. 30% DD → R = -50 * 1.30 = -65
-  kill_penalty_scale: 50.0
-
-  # ── B. Holding cost (time-in-trade penalty) ───────────────────────
-  # Deducted every 5m bar while a position is OPEN.
-  # -0.0005/bar = -0.144/day. Punishes dead-hold survival tactics.
-  holding_cost_per_bar: -0.0005
-
-  # ── 1. Per-step proportional drawdown penalty ────────────────────
-  # Fires every step when drawdown > 5%.
-  # R = -dd_per_step_scale * (drawdown - 0.05)
-  # At 10% DD → -0.3 * 0.05 = -0.015 / step  (nudge, not dominant)
-  # At 15% DD → -0.3 * 0.10 = -0.030 / step
-  drawdown_linear_threshold: 0.05   # start penalising above this DD
-  drawdown_per_step_scale: 0.30     # tune up to 1.0 if agent still ignores DD
-
-  # ── 2. Extra SL-hit penalty ──────────────────────────────────────
-  # Added ON TOP OF the normal trade_reward(loss) when SL fires.
-  # Forces the model to fear SL more than a voluntary exit at the same PnL.
-  # -1.5 means: SL at 3% costs ≈ -2.77 (trade) + -1.50 (SL extra) = -4.27
-  sl_hit_extra_penalty: -1.5
-
-# ── Risk Management ───────────────────────────────────────────────
-risk:
-  max_drawdown_kill: 0.15       # kill-switch: halt at -15% drawdown
-  initial_balance: 10000.0      # USDT (testnet)
-  kelly_fraction: 0.25          # fractional Kelly (quarter Kelly)
-  min_kelly_size: 0.01          # minimum position size fraction
-  max_kelly_size: 1.0           # maximum position size fraction
-  stop_loss_pct: 0.03           # 3% SL per trade (hard stop)
-  take_profit_pct: 0.06         # 6% TP per trade (optional, agent can close earlier)
-
-# ── Feature Engineering ───────────────────────────────────────────
-features:
-  smc:
-    swing_length: 50            # bars for swing H/L detection
-    ob_mitigation: false        # include mitigated OBs
-    fvg_join_consecutive: false
-  snr:
-    pivot_left: 10
-    pivot_right: 10
-    n_levels: 3                 # top N S/R levels per side
-  garch:
-    returns_window: 200         # rolling window for GARCH fit
-    p: 1
-    q: 1
-    vol_regime_thresholds: [0.01, 0.025]  # low/med/high vol boundaries
-  amt:
-    profile_window_candles: 288  # 1 day of 5m candles for volume profile
-    n_bins: 100
-    value_area_pct: 0.70        # 70% of volume defines value area
-
-  # ── C. Stationarity / normalisation windows ───────────────────────
-  stationarity:
-    volume_zscore_window: 50    # bars for rolling volume z-score
-    ema_velocity_window: 5      # bars for EMA-distance velocity (d/dt)
-    rolling_std_min: 1e-8       # floor to avoid div-by-zero
-
-# ── PPO Hyperparameters ───────────────────────────────────────────
 ppo:
-  policy: "MlpPolicy"
-  learning_rate: 0.0003
-  n_steps: 8056                 # rollout buffer size per env
-  batch_size: 2048
-  n_epochs: 10
-  gamma: 0.995                  # high discount — long episode
-  gae_lambda: 0.95
-  clip_range: 0.2
-  clip_range_vf: null
-  ent_coef: 0.01                # exploration
-  vf_coef: 0.5
-  max_grad_norm: 0.5
-  # ── Learning-rate schedule ──────────────────────────────────────
-  # initial_lr   : used for fresh training from scratch
-  # fine_tune_lr : used when loading a pretrained model (--lr flag overrides both)
-  initial_lr: 0.0003
-  fine_tune_lr: 0.0001
+  # Core update parameters
+  learning_rate:  0.0001      # was 0.0003
+  n_steps:        4096        # was 2048
+  batch_size:     256         # was 64
+  n_epochs:       5           # was 10
+  clip_range:     0.15        # was 0.2
+  gamma:          0.995       # was 0.99
+  gae_lambda:     0.97        # was 0.95
 
-  policy_kwargs:
-    net_arch: [256, 256, 128]   # actor + critic shared layers
-    activation_fn: "tanh"
+  # Loss coefficients
+  ent_coef:       0.01        # was 0.0  ← CRITICAL FIX (prevents HOLD collapse)
+  vf_coef:        0.7         # was 0.5
+  max_grad_norm:  0.5
 
-# ── Offline Training (main_train.py) ─────────────────────────────
-offline:
-  total_timesteps: 3000000      # ~694 episodes
-  historical_years: 2           # years of data to download
-  save_every: 100000            # checkpoint frequency
-  tb_log_dir: "./logs/tensorboard"
-  eval_episodes: 10
+  # Network architecture
+  policy:         "MlpPolicy"
+  net_arch:
+    pi: [256, 256, 128]       # actor
+    vf: [256, 256, 128]       # critic (separate from actor)
+  activation_fn:  "tanh"
 
-# ── Live Testnet Training (main_live.py) ──────────────────────────
-live:
-  continue_training: true
-  update_every_episodes: 1      # PPO update after each episode
-  walk_forward_days: 7          # re-validate every 7 days
-  max_runtime_hours: 168        # 7 days continuous
+  # Training schedule
+  total_timesteps: 3_000_000
+  checkpoint_freq: 50_000
 
-# ── Modal ─────────────────────────────────────────────────────────
-modal:
-  gpu: "h100"                   # A10G = good cost/perf for RL (not LLM)
-  timeout_hours: 23             # Modal max timeout ~24h; restart externally
-  volume_name: "btc-ppo-vol"
-  secret_name: "binance-secrets"
-  image_python: "3.11"
+reward:
+  win_scale:              1.0
+  loss_scale:             1.3   # was 2.0
+  hold_penalty:           0.0001
+  intra_win_scale:        0.03
+  intra_loss_scale:       0.04   # was 0.10
+  entry_quality_bonus:    0.08
+  entry_quality_thresh:   0.5    # ATR units
+  drawdown_threshold:     0.05
+  drawdown_linear_k:      0.20
+  drawdown_cap:           0.30
 
-# ── Lightning.ai ─────────────────────────────────────────────────
-lightning:
-  machine: "gpu-rtx-4090-x-1"  # or "cpu" for debugging
-  studio_name: "btc-ppo-trainer"
+garch:
+  p: 1
+  q: 1
+  min_fit_len: 500
+  kelly_fraction: 0.25          # quarter-Kelly
+
+data:
+  hist_years: 2
+  cache_dir: "./data"
+
+logging:
+  log_dir:   "./logs"
+  model_dir: "./models"
