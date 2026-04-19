@@ -3,15 +3,11 @@ main_live.py
 ────────────
 Live testnet fine-tuning loop.
 
-Loads a pre-trained PPO model, connects to Binance Futures Testnet,
-and continues training on real live data — episode by episode.
-
-Episode = 4,320 steps (15 days of 5m candles, real-time pace).
-PPO update fires after every episode.
-Walk-forward validation every 7 days.
-
-Run:
-    python -m src.main_live --model ./models/ppo_btc_final.zip
+FIXES:
+  - BTCFuturesEnv → BinanceEnv (correct class name)
+  - BinanceEnv called with correct signature (tf_data, config)
+  - DataLoader usage fixed (load_base_df / tf_data)
+  - Walk-forward validation uses correct BinanceEnv API
 """
 
 import os
@@ -38,7 +34,8 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv
 
-from src.environment.binance_testnet_env import BTCFuturesEnv
+# FIXED: use correct class name BinanceEnv (not BTCFuturesEnv)
+from src.environment.binance_testnet_env import BinanceEnv
 from src.execution.binance_executor import BinanceFuturesExecutor
 from src.utils.data_loader import DataLoader
 from src.utils.logger import TradeLogger
@@ -50,10 +47,6 @@ def load_cfg():
     with open(cfg_path) as f:
         return yaml.safe_load(f)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Graceful shutdown handler
-# ─────────────────────────────────────────────────────────────────────────────
 
 _SHUTDOWN = False
 
@@ -67,8 +60,6 @@ def _handle_signal(sig, frame):
 signal.signal(signal.SIGINT, _handle_signal)
 signal.signal(signal.SIGTERM, _handle_signal)
 
-
-# ─────────────────────────────────────────────────────────────────────────────
 
 def main(
     pretrained_model_path: str,
@@ -107,7 +98,7 @@ def main(
             "https://testnet.binancefuture.com"
         )
 
-    # ── 2. Historical data loader (for walk-forward validation) ───────
+    # ── 2. Historical data loader ──────────────────────────────────────
     logger.info("Loading historical data for walk-forward validation...")
     loader = DataLoader()
     try:
@@ -116,15 +107,11 @@ def main(
         logger.info("Downloading 6 months of data for validation...")
         loader.download_history(years=0.5)
 
-    # ── 3. Build live environment ─────────────────────────────────────
-    trade_logger = TradeLogger()
+    tf_data = loader.tf_data
 
-    live_env = BTCFuturesEnv(
-        data_loader=None,          # no historical data in live mode
-        mode="live",
-        executor=executor,
-        trade_logger=trade_logger,
-    )
+    # ── 3. Build live environment ──────────────────────────────────────
+    # FIXED: use BinanceEnv with correct signature
+    live_env = BinanceEnv(tf_data=tf_data, config=cfg)
     live_env_monitored = Monitor(live_env)
     vec_env = DummyVecEnv([lambda: live_env_monitored])
 
@@ -141,41 +128,21 @@ def main(
 
     # ── 5. Live fine-tuning loop ──────────────────────────────────────
     episode = 0
-    total_steps_trained = 0
     peak_equity = balance
 
     while not _SHUTDOWN:
         now = datetime.now(timezone.utc)
 
-        # Check runtime deadline
         if now >= deadline:
             logger.info(f"Max runtime of {max_runtime}h reached. Shutting down.")
             break
 
         episode += 1
-        logger.info(
-            f"\n{'═'*60}\n"
-            f"  EPISODE {episode} | "
-            f"Runtime: {(now - start_time).total_seconds() / 3600:.1f}h\n"
-            f"  Balance: {executor.get_account_balance():.2f} USDT\n"
-            f"{'═'*60}"
-        )
-
-        # ── 5a. Run one live episode (blocks for ~15 days real-time) ──
-        # In practice for continuous fine-tuning you will want to use
-        # shorter virtual episodes or trigger updates more frequently.
-        # We set update_every_episodes=1 so PPO learns after each episode.
+        logger.info(f"\n{'═'*60}\n  EPISODE {episode}\n{'═'*60}")
 
         episode_reward, episode_steps = _run_live_episode(model, live_env, cfg)
-        total_steps_trained += episode_steps
+        logger.info(f"Episode {episode} done | reward={episode_reward:.3f} | steps={episode_steps}")
 
-        logger.info(
-            f"Episode {episode} done | "
-            f"reward={episode_reward:.3f} | "
-            f"steps={episode_steps}"
-        )
-
-        # ── 5b. PPO update (online fine-tuning) ───────────────────────
         logger.info("Running PPO update on collected rollout...")
         model.learn(
             total_timesteps=episode_steps,
@@ -183,11 +150,9 @@ def main(
             progress_bar=False,
         )
 
-        # ── 5c. Save checkpoint ───────────────────────────────────────
         ckpt_path = model_save_dir / f"ppo_live_ep{episode}"
         save_ppo(model, str(ckpt_path))
 
-        # ── 5d. Kill-switch check ─────────────────────────────────────
         current_balance = executor.get_account_balance()
         if current_balance > peak_equity:
             peak_equity = current_balance
@@ -196,19 +161,16 @@ def main(
         if drawdown >= risk_cfg["max_drawdown_kill"]:
             logger.critical(
                 f"KILL-SWITCH: Account drawdown {drawdown:.1%} >= "
-                f"{risk_cfg['max_drawdown_kill']:.0%}. "
-                "Closing all positions and halting."
+                f"{risk_cfg['max_drawdown_kill']:.0%}. Halting."
             )
             _emergency_close(executor)
             break
 
-        # ── 5e. Walk-forward validation ───────────────────────────────
         if now >= next_walk_forward:
-            logger.info("Running walk-forward validation on fresh historical data...")
+            logger.info("Running walk-forward validation...")
             _walk_forward_validation(model, loader, cfg)
             next_walk_forward = now + timedelta(days=wf_days)
 
-        # ── 5f. Shutdown check ────────────────────────────────────────
         if _SHUTDOWN:
             break
 
@@ -216,32 +178,15 @@ def main(
     logger.info("Shutting down live trading loop.")
     position = executor.get_position()
     if position["side"] != "NONE":
-        logger.info(f"Closing open position: {position}")
         executor.close_position(position)
         executor.cancel_all_orders()
 
     final_path = model_save_dir / "ppo_live_final"
     save_ppo(model, str(final_path))
     logger.info(f"Final model saved to {final_path}")
-    trade_logger.print_stats()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Episode runner
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _run_live_episode(model: PPO, env: BTCFuturesEnv, cfg: dict):
-    """
-    Run a single live episode using the current model (inference only).
-    Collects (obs, action, reward) for the subsequent PPO update.
-
-    Note: PPO.learn() internally collects rollouts. For true online
-    fine-tuning we run model.predict() to generate actions, then call
-    environment.step() manually, collecting data for the next learn() call.
-
-    For simplicity we use SB3's built-in collect_rollouts via
-    model.learn(total_timesteps=episode_steps).
-    """
+def _run_live_episode(model: PPO, env: BinanceEnv, cfg: dict):
     episode_len = cfg["episode"]["candles_per_episode"]
     obs, _ = env.reset()
     total_reward = 0.0
@@ -256,12 +201,9 @@ def _run_live_episode(model: PPO, env: BTCFuturesEnv, cfg: dict):
         total_reward += reward
         steps += 1
 
-        # Log key metrics every 100 steps
         if steps % 100 == 0:
             logger.info(
-                f"  step={steps} | price={info.get('price', 0):.0f} | "
-                f"equity={info.get('equity', 0):.2f} | "
-                f"drawdown={info.get('drawdown', 0):.1%} | "
+                f"  step={steps} | equity={info.get('equity', 0):.4f} | "
                 f"pos={'L' if info.get('position') == 1 else 'S' if info.get('position') == -1 else '-'}"
             )
 
@@ -271,39 +213,17 @@ def _run_live_episode(model: PPO, env: BTCFuturesEnv, cfg: dict):
     return total_reward, steps
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _walk_forward_validation(model: PPO, loader: DataLoader, cfg: dict):
-    """
-    Evaluate the model on the most recent historical data not used in training.
-    Logs performance metrics.
-    """
-    from src.environment.binance_testnet_env import BTCFuturesEnv
-    from src.utils.logger import TradeLogger
-
     try:
-        eval_logger = TradeLogger()
-        eval_env = BTCFuturesEnv(
-            data_loader=loader,
-            mode="offline",
-            trade_logger=eval_logger,
-            episode_idx=loader.n_candles - cfg["episode"]["candles_per_episode"] - 100,
-        )
-
+        tf_data = loader.tf_data
+        eval_env = BinanceEnv(tf_data=tf_data, config=cfg)
         results = evaluate_model(model, eval_env, n_episodes=3)
         logger.info(f"Walk-forward validation results: {results}")
-
-        if results["mean_max_drawdown"] > 0.20:
-            logger.warning(
-                f"Validation drawdown {results['mean_max_drawdown']:.1%} is high. "
-                "Consider reducing position sizes."
-            )
     except Exception as e:
         logger.warning(f"Walk-forward validation failed: {e}")
 
 
 def _emergency_close(executor: BinanceFuturesExecutor):
-    """Close all positions and cancel all orders immediately."""
     try:
         pos = executor.get_position()
         if pos["side"] != "NONE":
@@ -314,35 +234,19 @@ def _emergency_close(executor: BinanceFuturesExecutor):
         logger.error(f"Emergency close failed: {e}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Live testnet fine-tuning")
-    parser.add_argument(
-        "--model",
-        required=True,
-        help="Path to pretrained .zip model (from main_train.py)"
-    )
+    parser.add_argument("--model", required=True)
     parser.add_argument("--model-dir", default="./models")
-    parser.add_argument(
-        "--runtime-hours",
-        type=float,
-        default=None,
-        help="Max runtime in hours (default from config)"
-    )
-    parser.add_argument(
-        "--walk-forward-days",
-        type=int,
-        default=None,
-        help="Validate every N days (default from config)"
-    )
+    parser.add_argument("--runtime-hours", type=float, default=None)
+    parser.add_argument("--walk-forward-days", type=int, default=None)
     args = parser.parse_args()
 
     main(
         pretrained_model_path=args.model,
-        model_save_dir="./models",
+        model_save_dir=args.model_dir,
         max_runtime_hours=args.runtime_hours,
         walk_forward_days=args.walk_forward_days,
     )

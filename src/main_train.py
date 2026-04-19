@@ -45,14 +45,10 @@ def load_cfg():
         return yaml.safe_load(f)
 
 
-def make_env(data_loader: DataLoader, trade_logger: TradeLogger, seed: int = 0):
+def make_env(tf_data: dict, cfg: dict, seed: int = 0):
     """Factory function for vectorised env creation."""
     def _init():
-        env = BinanceEnv(
-            data_loader=data_loader,
-            mode="offline",
-            trade_logger=trade_logger,
-        )
+        env = BinanceEnv(tf_data=tf_data, config=cfg)
         env = Monitor(env)
         return env
     return _init
@@ -64,7 +60,7 @@ def main(
     total_timesteps: int = None,
     n_envs: int = 1,
     pretrained_path: str = None,
-    learning_rate: float = None,   # [3] CLI --lr override
+    learning_rate: float = None,
 ):
     cfg = load_cfg()
     offline_cfg = cfg["offline"]
@@ -78,14 +74,14 @@ def main(
 
     # ── 1. Load / download historical data ───────────────────────────
     logger.info("Loading historical data...")
-    loader = DataLoader(data_dir=data_dir)
+    loader = DataLoader(data_dir=data_dir, years=offline_cfg.get("historical_years", 2))
 
     try:
         loader.load_base_df()
         logger.info(f"Loaded cached data: {loader.n_candles:,} 5m bars")
     except FileNotFoundError:
         logger.info("Downloading historical data (first run)...")
-        loader.download_history(years=offline_cfg["historical_years"])
+        loader.download_history(years=offline_cfg.get("historical_years", 2))
 
     if loader.n_candles < 5000:
         raise RuntimeError(
@@ -93,29 +89,25 @@ def main(
             "Download more data with download_history()."
         )
 
+    tf_data = loader.tf_data
+
     # ── 2. Build environments ─────────────────────────────────────────
-    trade_logger = TradeLogger()
-
     if n_envs == 1:
-        env = DummyVecEnv([make_env(loader, trade_logger)])
+        env = DummyVecEnv([make_env(tf_data, cfg)])
     else:
-        env = SubprocVecEnv([make_env(loader, trade_logger, seed=i) for i in range(n_envs)])
+        env = SubprocVecEnv([make_env(tf_data, cfg, seed=i) for i in range(n_envs)])
 
-    # Eval env (single, deterministic)
-    eval_env = DummyVecEnv([make_env(loader, TradeLogger())])
+    eval_env = DummyVecEnv([make_env(tf_data, cfg)])
 
     # ── 3. Build or load model ────────────────────────────────────────
     if pretrained_path and Path(pretrained_path).exists():
         logger.info(f"Loading pretrained model from {pretrained_path}")
-        from src.models.ppo_model import load_ppo
+        from src.models.ppo_model import load_ppo, update_lr
         model = load_ppo(pretrained_path, env=env)
-        # Apply LR override/fine-tune schedule on loaded model
         effective_lr = learning_rate or cfg["ppo"].get("fine_tune_lr", 1e-4)
-        from src.models.ppo_model import update_lr
         update_lr(model, effective_lr)
     else:
         logger.info("Building new PPO model...")
-        # Resolve LR: explicit arg → config fine_tune_lr (if resuming) → initial_lr
         if learning_rate is None and pretrained_path:
             learning_rate = cfg["ppo"].get("fine_tune_lr", 1e-4)
         model = build_ppo(env, cfg=cfg, learning_rate=learning_rate)
@@ -129,7 +121,6 @@ def main(
 
     # ── 5. Train ─────────────────────────────────────────────────────
     logger.info(f"Starting offline training: {total_timesteps:,} timesteps")
-    logger.info(f"  Episodes ≈ {total_timesteps // cfg['episode']['candles_per_episode']:,}")
 
     model.learn(
         total_timesteps=total_timesteps,
@@ -145,10 +136,9 @@ def main(
 
     # ── 7. Evaluate ───────────────────────────────────────────────────
     logger.info("Running post-training evaluation...")
-    eval_env_single = make_env(loader, TradeLogger())()
-    results = evaluate_model(model, eval_env_single, n_episodes=offline_cfg["eval_episodes"])
+    eval_env_single = make_env(tf_data, cfg)()
+    results = evaluate_model(model, eval_env_single, n_episodes=offline_cfg.get("eval_episodes", 5))
     logger.info(f"Eval results: {results}")
-    trade_logger.print_stats()
 
     return final_path
 
@@ -161,8 +151,8 @@ if __name__ == "__main__":
     parser.add_argument("--data-dir", default="./data")
     parser.add_argument("--timesteps", type=int, default=None)
     parser.add_argument("--n-envs", type=int, default=1)
-    parser.add_argument("--pretrained", default=None, help="Path to .zip model to continue from")
-    parser.add_argument("--lr", type=float, default=None, help="Learning rate override (e.g. 1e-4)")
+    parser.add_argument("--pretrained", default=None)
+    parser.add_argument("--lr", type=float, default=None)
     args = parser.parse_args()
 
     main(

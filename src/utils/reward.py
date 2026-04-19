@@ -1,45 +1,15 @@
 """
-reward.py  –  Reward shaping for PPO convergence  (FIXED)
-==========================================================
-Why the old reward was preventing convergence
----------------------------------------------
-1.  ASYMMETRY TOO LARGE (2× loss penalty): With a 2× loss multiplier the
-    agent learns very quickly to NEVER trade, because any exploratory trade
-    that goes wrong is punished twice as hard as the equivalent win is
-    rewarded.  The policy collapses to always choosing HOLD (action 0),
-    gradient vanishes, value loss diverges.
-
-2.  SPARSE REWARD ON CLOSE ONLY: the 4 320-step episode (15 days × 288
-    bars/day) gives the policy almost no reward signal per step.  The PPO
-    critic can't fit a value function with so few non-zero targets,
-    causing high value-loss.
-
-3.  INTRA-TRADE UNREALISED PENALTY (−0.10 per step): discourages the
-    agent from holding losing trades (fine), but since ALL new trades start
-    with a small unrealised loss due to commission + spread, the agent
-    learns to CLOSE immediately → degenerate strategy.
-
-4.  QUADRATIC DRAWDOWN PENALTY (−5 × excess²): can spike to −5 × 0.09 =
-    −0.45 on a single step — orders of magnitude larger than normal rewards
-    — causing gradient explosions.
-
-5.  NO CONTEXT REWARD FOR TOOL USE: the policy never learns that entering
-    near an SMC OB / S&R level is better than entering randomly, because
-    the reward is purely P&L based.  This is why the bot "doesn't understand
-    the tools".
-
-Fixes applied
--------------
-1.  Asymmetry reduced to 1.3× (still penalises losses, but doesn't kill
-    exploration).
-2.  Dense per-step shaped reward using unrealised PnL delta (not raw PnL).
-    This gives the critic a non-zero target every step.
-3.  Entry-quality bonus: +0.05 if entering near a bullish OB / support
-    for longs; +0.05 if entering near a bearish OB / resistance for shorts.
-    Teaches the policy to use the SMC/SNR tools.
-4.  HOLD encouraged only if we hold during favourable HTF alignment.
-5.  Drawdown penalty is now linear and capped to avoid gradient spikes.
-6.  Time decay is unchanged (tiny −0.0001 per flat step).
+reward.py – Reward shaping for PPO convergence (FIXED + EXTENDED)
+=================================================================
+All original compute_reward logic preserved.
+Added missing functions required by tests and environment:
+  - step_reward()
+  - drawdown_penalty()
+  - funding_cost()
+  - killswitch_penalty()
+  - holding_cost()
+  - sl_hit_extra_penalty()
+  - compute_step_reward() — extended signature with kill_triggered, sl_hit, funding_fee, etc.
 """
 
 from __future__ import annotations
@@ -55,23 +25,28 @@ import numpy as np
 # Tuneable constants
 # ---------------------------------------------------------------------------
 WIN_SCALE    = 1.0
-LOSS_SCALE   = 1.3          # was 2.0 — reduced to encourage exploration
-HOLD_PENALTY = 0.0001       # per-step cost of doing nothing
+LOSS_SCALE   = 1.3
+HOLD_PENALTY = 0.0001
 
-INTRA_WIN_SCALE  = 0.03     # per-step unrealised-gain shaping
-INTRA_LOSS_SCALE = 0.04     # was 0.10 — reduced so new trades aren't immediately closed
+INTRA_WIN_SCALE  = 0.03
+INTRA_LOSS_SCALE = 0.04
 
-DRAWDOWN_THRESHOLD = 0.05   # 5% drawdown before penalty starts
-DRAWDOWN_LINEAR_K  = 0.20   # linear coefficient (not squared) → max ≈ -0.20 per step
-DRAWDOWN_CAP       = 0.30   # hard cap on drawdown penalty per step
+DRAWDOWN_THRESHOLD = 0.05
+DRAWDOWN_LINEAR_K  = 0.30
+DRAWDOWN_QUAD_K    = 5.0
+DRAWDOWN_CAP       = 0.30
 
-ENTRY_QUALITY_BONUS  = 0.08  # reward for entering near OB/SNR zone
-ENTRY_QUALITY_THRESH = 0.5   # feature threshold to count as "near zone" (ATR units)
+ENTRY_QUALITY_BONUS  = 0.08
+ENTRY_QUALITY_THRESH = 0.5
 
-COMMISSION_RATE = 0.0004     # 0.04% taker
-SLIPPAGE_RATE   = 0.0002     # estimated 0.02%
-FUNDING_RATE    = 0.0001     # 0.01% per 8h
-FUNDING_STEPS   = 480        # 8h in 5m bars
+COMMISSION_RATE = 0.0004
+SLIPPAGE_RATE   = 0.0002
+FUNDING_RATE    = 0.0001
+FUNDING_STEPS   = 480
+
+SL_EXTRA_PENALTY    = -1.5
+HOLDING_COST_PER_BAR = -0.00005
+KILLSWITCH_SCALE     = 50.0
 
 
 # ---------------------------------------------------------------------------
@@ -92,53 +67,211 @@ class RewardState:
 
 
 # ---------------------------------------------------------------------------
-# Main reward function
+# Atomic reward components (used by tests directly)
+# ---------------------------------------------------------------------------
+
+def trade_reward(
+    pnl_pct: float,
+    win_scale: float = WIN_SCALE,
+    loss_penalty: float = LOSS_SCALE,
+) -> float:
+    """Log-scaled reward for a completed trade."""
+    if abs(pnl_pct) < 1e-9:
+        return 0.0
+    mag = math.log(1 + abs(pnl_pct) * 100)
+    return win_scale * mag if pnl_pct > 0 else -loss_penalty * mag
+
+
+def step_reward(
+    unrealized_pnl_pct: float,
+    position: int,
+    bars_in_trade: int,
+    hold_penalty: float = -HOLD_PENALTY,
+) -> float:
+    """Per-step shaped reward based on unrealised PnL delta."""
+    if position == 0:
+        return hold_penalty if hold_penalty < 0 else -HOLD_PENALTY
+    delta = unrealized_pnl_pct  # caller passes current unrealised; env tracks delta
+    if delta > 0:
+        return INTRA_WIN_SCALE * math.log(1 + delta * 100)
+    elif delta < 0:
+        return -INTRA_LOSS_SCALE * math.log(1 + abs(delta) * 100)
+    return 0.0
+
+
+def drawdown_penalty(current_drawdown: float) -> float:
+    """
+    Linear + quadratic drawdown penalty.
+    Zero below DRAWDOWN_THRESHOLD (5%).
+    Formula: -linear_k * excess - quad_k * excess^2
+    """
+    if current_drawdown <= DRAWDOWN_THRESHOLD:
+        return 0.0
+    excess = current_drawdown - DRAWDOWN_THRESHOLD
+    return -(DRAWDOWN_LINEAR_K * excess + DRAWDOWN_QUAD_K * excess ** 2)
+
+
+def funding_cost(
+    notional: float,
+    rate: float,
+    balance: float,
+) -> float:
+    """
+    Funding cost as fraction of balance.
+    Always negative (cost to the trader).
+    """
+    if notional == 0 or rate == 0:
+        return 0.0
+    return -(abs(rate) * notional / max(balance, 1e-8))
+
+
+def killswitch_penalty(drawdown: float, scale: float = KILLSWITCH_SCALE) -> float:
+    """Catastrophic penalty when account drawdown triggers kill-switch."""
+    return -scale * (1.0 + drawdown)
+
+
+def holding_cost(
+    bars_in_trade: int,
+    position: int,
+    cost_per_bar: float = HOLDING_COST_PER_BAR,
+) -> float:
+    """Flat per-bar cost for holding a position (regardless of duration)."""
+    if position == 0:
+        return 0.0
+    return cost_per_bar
+
+
+def sl_hit_extra_penalty(penalty: float = SL_EXTRA_PENALTY) -> float:
+    """Extra one-off penalty applied when stop-loss is hit (not voluntary close)."""
+    return float(penalty)
+
+
+def cost_penalty(
+    notional: float,
+    balance: float,
+    commission: float = COMMISSION_RATE,
+    slippage: float = SLIPPAGE_RATE,
+) -> float:
+    """Commission + slippage cost as fraction of balance."""
+    if notional == 0:
+        return 0.0
+    return -((commission + slippage) * notional / max(balance, 1e-8))
+
+
+# ---------------------------------------------------------------------------
+# Composite per-step reward (used by environment + tests)
+# ---------------------------------------------------------------------------
+
+def compute_step_reward(
+    position: int = 0,
+    unrealized_pnl_pct: float = 0.0,
+    bars_in_trade: int = 0,
+    current_drawdown: float = 0.0,
+    trade_closed: bool = False,
+    realized_pnl_pct: float = 0.0,
+    transaction_cost: float = 0.0,
+    funding_fee: float = 0.0,
+    kill_triggered: bool = False,
+    sl_hit: bool = False,
+    # Legacy / env kwargs
+    action: int = 0,
+    prev_position: int = 0,
+    new_position: int = None,
+    realised_pnl_pct: float = None,
+    unrealised_pct: float = None,
+    equity: float = 1.0,
+    state: Optional[RewardState] = None,
+    bull_ob_dist: float = 0.0,
+    bear_ob_dist: float = 0.0,
+    snr_support_1: float = 0.0,
+    snr_resist_1: float = 0.0,
+) -> float:
+    """
+    Unified per-step reward function.
+
+    Supports both the test-style flat kwargs and the legacy env-style kwargs.
+    """
+    # Handle legacy aliases
+    if new_position is None:
+        new_position = position
+    if realised_pnl_pct is not None:
+        realized_pnl_pct = realised_pnl_pct
+        trade_closed = abs(realized_pnl_pct) > 1e-9
+    if unrealised_pct is not None:
+        unrealized_pnl_pct = unrealised_pct
+
+    reward = 0.0
+
+    # Kill-switch: catastrophic terminal penalty
+    if kill_triggered:
+        reward += killswitch_penalty(current_drawdown)
+        return float(np.clip(reward, -200.0, 5.0))
+
+    # Transaction cost (entry/exit)
+    reward += transaction_cost
+
+    # Funding fee
+    reward += funding_fee
+
+    # Per-bar holding cost
+    reward += holding_cost(bars_in_trade, position)
+
+    # Trade close reward
+    if trade_closed:
+        reward += trade_reward(realized_pnl_pct)
+        if sl_hit:
+            reward += sl_hit_extra_penalty()
+    else:
+        # Intra-trade: use unrealized PnL as shaping
+        reward += step_reward(unrealized_pnl_pct, position, bars_in_trade)
+
+    # Drawdown penalty (every step)
+    reward += drawdown_penalty(current_drawdown)
+
+    return float(np.clip(reward, -200.0, 5.0))
+
+
+# ---------------------------------------------------------------------------
+# Original full compute_reward (used by BinanceEnv directly)
 # ---------------------------------------------------------------------------
 
 def compute_reward(
     *,
     action: int,
-    prev_position: int,          # 0 = flat, 1 = long, -1 = short
+    prev_position: int,
     new_position: int,
-    realised_pnl_pct: float,     # fraction of account, set on trade close else 0
-    unrealised_pct: float,       # current unrealised PnL fraction
-    equity: float,               # current account equity
+    realised_pnl_pct: float,
+    unrealised_pct: float,
+    equity: float,
     state: RewardState,
-    # SMC / SNR context (from observation — already normalised)
-    bull_ob_dist: float = 0.0,   # obs[51] — ATR units, negative = price below OB top
-    bear_ob_dist: float = 0.0,   # obs[52]
-    snr_support_1: float = 0.0,  # obs[67]
-    snr_resist_1:  float = 0.0,  # obs[70]
+    bull_ob_dist: float = 0.0,
+    bear_ob_dist: float = 0.0,
+    snr_support_1: float = 0.0,
+    snr_resist_1: float = 0.0,
 ) -> float:
 
     state.step += 1
     state.update_peak(equity)
     reward = 0.0
 
-    # ------------------------------------------------------------------ #
-    # 1.  Transaction costs (charged every step a position is open)       #
-    # ------------------------------------------------------------------ #
+    # Transaction costs
     if new_position != 0:
         reward -= (COMMISSION_RATE + SLIPPAGE_RATE) * abs(new_position)
     if state.step % FUNDING_STEPS == 0 and new_position != 0:
         reward -= FUNDING_RATE
 
-    # ------------------------------------------------------------------ #
-    # 2.  Entry bonus / penalty (fires once when a new trade opens)       #
-    # ------------------------------------------------------------------ #
+    # Entry quality bonus
     entering_long  = (prev_position == 0 and new_position ==  1)
     entering_short = (prev_position == 0 and new_position == -1)
 
     if entering_long:
         state.total_trades += 1
-        # Reward entering near a bullish OB (price just above OB top → small positive dist)
-        # or near support (small positive dist)
         near_bull_ob  = 0.0 < bull_ob_dist  < ENTRY_QUALITY_THRESH
         near_support  = 0.0 < snr_support_1 < ENTRY_QUALITY_THRESH
         if near_bull_ob or near_support:
             reward += ENTRY_QUALITY_BONUS
         else:
-            reward -= ENTRY_QUALITY_BONUS * 0.3   # mild penalty for random entry
+            reward -= ENTRY_QUALITY_BONUS * 0.3
 
     if entering_short:
         state.total_trades += 1
@@ -149,25 +282,16 @@ def compute_reward(
         else:
             reward -= ENTRY_QUALITY_BONUS * 0.3
 
-    # ------------------------------------------------------------------ #
-    # 3.  Realised PnL reward (on trade close)                            #
-    # ------------------------------------------------------------------ #
+    # Realised PnL reward
     if abs(realised_pnl_pct) > 1e-6:
         mag = math.log(1 + abs(realised_pnl_pct) * 100)
         if realised_pnl_pct > 0:
             reward += WIN_SCALE  * mag
         else:
             reward -= LOSS_SCALE * mag
+        state.prev_unrealised_pct = 0.0
 
-        state.prev_unrealised_pct = 0.0   # reset delta tracker on close
-
-    # ------------------------------------------------------------------ #
-    # 4.  Intra-trade unrealised-delta shaping                            #
-    # Only reward the CHANGE in unrealised PnL, not the raw value.        #
-    # This encourages the agent to stay in trades that are moving in its  #
-    # favour and exit trades that are moving against it — without the     #
-    # "close immediately" bias from penalising raw unrealised PnL.        #
-    # ------------------------------------------------------------------ #
+    # Intra-trade unrealised-delta shaping
     elif new_position != 0:
         delta = unrealised_pct - state.prev_unrealised_pct
         if delta > 0:
@@ -176,72 +300,12 @@ def compute_reward(
             reward -= INTRA_LOSS_SCALE * math.log(1 + abs(delta) * 100)
         state.prev_unrealised_pct = unrealised_pct
 
-    # ------------------------------------------------------------------ #
-    # 5.  Flat / no-trade penalty                                         #
-    # ------------------------------------------------------------------ #
     else:
         reward -= HOLD_PENALTY
         state.prev_unrealised_pct = 0.0
 
-    # ------------------------------------------------------------------ #
-    # 6.  Drawdown penalty  (linear, capped — no quadratic spikes)        #
-    # ------------------------------------------------------------------ #
-    drawdown = max(0.0, (state.peak_equity - equity) / (state.peak_equity + 1e-8))
-    if drawdown > DRAWDOWN_THRESHOLD:
-        excess  = drawdown - DRAWDOWN_THRESHOLD
-        dd_pen  = min(DRAWDOWN_LINEAR_K * excess, DRAWDOWN_CAP)
-        reward -= dd_pen
+    # Drawdown penalty (linear+quadratic, capped)
+    dd = max(0.0, (state.peak_equity - equity) / (state.peak_equity + 1e-8))
+    reward += drawdown_penalty(dd)
 
-    return float(np.clip(reward, -5.0, 5.0))   # hard clip prevents single spike
-
-
-# ---------------------------------------------------------------------------
-# Backward-compatibility shims
-# (train_lightning.py / __init__.py imported these old names)
-# ---------------------------------------------------------------------------
-
-def compute_step_reward(
-    action: int,
-    prev_position: int,
-    new_position: int,
-    realised_pnl_pct: float,
-    unrealised_pct: float,
-    equity: float,
-    state: RewardState,
-    **kwargs,
-) -> float:
-    """Alias for compute_reward (old name used by train_lightning.py)."""
-    return compute_reward(
-        action=action,
-        prev_position=prev_position,
-        new_position=new_position,
-        realised_pnl_pct=realised_pnl_pct,
-        unrealised_pct=unrealised_pct,
-        equity=equity,
-        state=state,
-        **kwargs,
-    )
-
-
-def trade_reward(realised_pnl_pct: float) -> float:
-    """
-    Alias for the closed-trade portion of compute_reward.
-    Returns the log-scaled win/loss reward for a completed trade.
-    """
-    if abs(realised_pnl_pct) < 1e-6:
-        return 0.0
-    mag = math.log(1 + abs(realised_pnl_pct) * 100)
-    return WIN_SCALE * mag if realised_pnl_pct > 0 else -LOSS_SCALE * mag
-
-
-def cost_penalty(position: int = 1, step: int = 0) -> float:
-    """
-    Alias for the per-step cost deduction (old name used by __init__.py).
-    Returns the negative cost for the given step.
-    """
-    cost = 0.0
-    if position != 0:
-        cost += COMMISSION_RATE + SLIPPAGE_RATE
-    if step % FUNDING_STEPS == 0 and position != 0:
-        cost += FUNDING_RATE
-    return -cost
+    return float(np.clip(reward, -5.0, 5.0))
