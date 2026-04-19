@@ -56,6 +56,20 @@ reward:
   # -0.0005/bar = -0.144/day. Punishes dead-hold survival tactics.
   holding_cost_per_bar: -0.0005
 
+  # ── 1. Per-step proportional drawdown penalty ────────────────────
+  # Fires every step when drawdown > 5%.
+  # R = -dd_per_step_scale * (drawdown - 0.05)
+  # At 10% DD → -0.3 * 0.05 = -0.015 / step  (nudge, not dominant)
+  # At 15% DD → -0.3 * 0.10 = -0.030 / step
+  drawdown_linear_threshold: 0.05   # start penalising above this DD
+  drawdown_per_step_scale: 0.30     # tune up to 1.0 if agent still ignores DD
+
+  # ── 2. Extra SL-hit penalty ──────────────────────────────────────
+  # Added ON TOP OF the normal trade_reward(loss) when SL fires.
+  # Forces the model to fear SL more than a voluntary exit at the same PnL.
+  # -1.5 means: SL at 3% costs ≈ -2.77 (trade) + -1.50 (SL extra) = -4.27
+  sl_hit_extra_penalty: -1.5
+
 # ── Risk Management ───────────────────────────────────────────────
 risk:
   max_drawdown_kill: 0.15       # kill-switch: halt at -15% drawdown
@@ -96,8 +110,8 @@ features:
 ppo:
   policy: "MlpPolicy"
   learning_rate: 0.0003
-  n_steps: 2048                 # rollout buffer size per env
-  batch_size: 256
+  n_steps: 8056                 # rollout buffer size per env
+  batch_size: 2048
   n_epochs: 10
   gamma: 0.995                  # high discount — long episode
   gae_lambda: 0.95
@@ -106,6 +120,12 @@ ppo:
   ent_coef: 0.01                # exploration
   vf_coef: 0.5
   max_grad_norm: 0.5
+  # ── Learning-rate schedule ──────────────────────────────────────
+  # initial_lr   : used for fresh training from scratch
+  # fine_tune_lr : used when loading a pretrained model (--lr flag overrides both)
+  initial_lr: 0.0003
+  fine_tune_lr: 0.0001
+
   policy_kwargs:
     net_arch: [256, 256, 128]   # actor + critic shared layers
     activation_fn: "tanh"

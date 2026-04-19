@@ -396,3 +396,197 @@ class TestKillTriggeredInComposite:
         assert r_in < r_out, (
             f"In-trade reward {r_in:.5f} should be lower than flat {r_out:.5f} due to holding cost"
         )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# v3 ADDITIONS
+# ═════════════════════════════════════════════════════════════════════════════
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [1] drawdown_penalty — linear + quadratic two-component
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestDrawdownPenaltyV3:
+    """
+    v3 drawdown_penalty = linear_component + quadratic_component.
+    Linear fires every step above threshold (default 5%).
+    """
+
+    def test_zero_below_threshold(self):
+        from src.utils.reward import drawdown_penalty
+        for dd in [0.0, 0.01, 0.04, 0.049]:
+            assert drawdown_penalty(dd) == 0.0, f"Expected 0 at dd={dd}"
+
+    def test_negative_above_threshold(self):
+        from src.utils.reward import drawdown_penalty
+        for dd in [0.051, 0.08, 0.10, 0.14]:
+            r = drawdown_penalty(dd)
+            assert r < 0.0, f"Expected negative at dd={dd}, got {r}"
+
+    def test_linear_component_exact(self):
+        """
+        At dd=0.08: excess=0.03
+        linear    = -0.30 * 0.03 = -0.009
+        quadratic = -5 * (0.03)^2 = -0.0045
+        total     = -0.0135
+        """
+        from src.utils.reward import drawdown_penalty
+        r = drawdown_penalty(0.08)
+        expected = -0.30 * 0.03 + -5.0 * (0.03 ** 2)
+        assert r == pytest.approx(expected, rel=1e-6), f"Expected {expected:.6f}, got {r:.6f}"
+
+    def test_strictly_increasing_with_drawdown(self):
+        from src.utils.reward import drawdown_penalty
+        dds = [0.05, 0.07, 0.09, 0.11, 0.13, 0.14]
+        penalties = [drawdown_penalty(d) for d in dds]
+        for i in range(1, len(penalties)):
+            assert penalties[i] < penalties[i-1], (
+                f"Penalty should worsen with DD: {penalties[i-1]:.5f} → {penalties[i]:.5f}"
+            )
+
+    def test_linear_grows_proportionally(self):
+        """
+        Between dd=6% and dd=11%, linear component doubles (excess 1% → 6%).
+        Full penalty also grows, but quadratic is small at low DD.
+        """
+        from src.utils.reward import drawdown_penalty
+        # At these DDs, quadratic is tiny → penalty ≈ linear
+        r_lo = drawdown_penalty(0.06)   # excess = 0.01
+        r_hi = drawdown_penalty(0.11)   # excess = 0.06  (6× the excess)
+        # Penalty should be at least 4× larger (linear dominates at low DD)
+        assert abs(r_hi) > abs(r_lo) * 3.0, (
+            f"Penalty at 11% ({r_hi:.4f}) should be >> penalty at 6% ({r_lo:.4f})"
+        )
+
+    def test_fires_every_step_when_in_drawdown(self):
+        """
+        Unlike v2 quadratic-only, v3 linear component fires even at mild DD.
+        Calling 100× at 8% DD should accumulate a meaningful total.
+        """
+        from src.utils.reward import drawdown_penalty
+        per_step = drawdown_penalty(0.08)   # -0.0135
+        total_100 = per_step * 100
+        assert total_100 < -1.0, (
+            f"100 steps at 8% DD should accumulate at least -1.0, got {total_100:.3f}"
+        )
+
+    def test_magnitude_never_dominates_trade_reward(self):
+        """Per-step DD penalty should never exceed a single small win."""
+        from src.utils.reward import drawdown_penalty, trade_reward
+        worst_step = drawdown_penalty(0.149)   # just under kill threshold
+        small_win  = trade_reward(0.005)       # tiny 0.5% win
+        assert abs(worst_step) < abs(small_win), (
+            f"DD per-step |{worst_step:.4f}| should be < small win |{small_win:.4f}|"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [1] sl_hit_extra_penalty
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestSLHitPenalty:
+
+    def test_returns_negative_float(self):
+        from src.utils.reward import sl_hit_extra_penalty
+        r = sl_hit_extra_penalty()
+        assert isinstance(r, float)
+        assert r < 0.0
+
+    def test_default_value(self):
+        from src.utils.reward import sl_hit_extra_penalty
+        r = sl_hit_extra_penalty()
+        assert r == pytest.approx(-1.5, rel=1e-6)
+
+    def test_custom_value(self):
+        from src.utils.reward import sl_hit_extra_penalty
+        assert sl_hit_extra_penalty(-2.0) == pytest.approx(-2.0)
+        assert sl_hit_extra_penalty(-0.5) == pytest.approx(-0.5)
+
+    def test_sl_exit_worse_than_voluntary_exit(self):
+        """SL at -3% must be meaningfully worse than voluntary exit at -3%."""
+        from src.utils.reward import trade_reward, sl_hit_extra_penalty
+        voluntary = trade_reward(-0.03)
+        sl_exit   = trade_reward(-0.03) + sl_hit_extra_penalty()
+        assert sl_exit < voluntary, "SL exit should have worse reward than voluntary"
+        gap = abs(sl_exit) - abs(voluntary)
+        assert gap == pytest.approx(1.5, rel=1e-4), f"Gap should be |sl_extra|=1.5, got {gap:.4f}"
+
+    def test_sl_not_so_large_it_deters_all_trades(self):
+        """
+        Even after SL sting, a subsequent 2% winning trade should
+        more than recover.  Otherwise agent learns: never open trades.
+        """
+        from src.utils.reward import trade_reward, sl_hit_extra_penalty
+        sl_loss = trade_reward(-0.03) + sl_hit_extra_penalty()   # ≈ -4.27
+        win     = trade_reward(0.02)                             # ≈ +1.38
+        # Three good trades > one SL hit
+        assert win * 3 > abs(sl_loss), (
+            f"3× win={win*3:.2f} should > |SL loss|={abs(sl_loss):.2f} — "
+            f"otherwise agent won't trade"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [1+A] compute_step_reward with sl_hit parameter
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestComputeRewardV3:
+
+    def _base(self, **kw):
+        d = dict(position=0, unrealized_pnl_pct=0.0, bars_in_trade=0,
+                 current_drawdown=0.0, trade_closed=False, realized_pnl_pct=0.0,
+                 transaction_cost=0.0, funding_fee=0.0)
+        d.update(kw)
+        return d
+
+    def test_sl_hit_worsens_trade_close_reward(self):
+        r_voluntary = compute_step_reward(**self._base(
+            trade_closed=True, realized_pnl_pct=-0.03
+        ))
+        r_sl = compute_step_reward(**self._base(
+            trade_closed=True, realized_pnl_pct=-0.03, sl_hit=True
+        ))
+        assert r_sl < r_voluntary, "SL reward should be worse than voluntary at same PnL"
+        assert r_voluntary - r_sl == pytest.approx(1.5, rel=1e-4)
+
+    def test_sl_hit_false_no_extra_penalty(self):
+        """sl_hit=False (default) must not add any extra penalty."""
+        r1 = compute_step_reward(**self._base(trade_closed=True, realized_pnl_pct=-0.02))
+        r2 = compute_step_reward(**self._base(trade_closed=True, realized_pnl_pct=-0.02, sl_hit=False))
+        assert r1 == pytest.approx(r2, rel=1e-8)
+
+    def test_sl_hit_only_on_trade_close(self):
+        """sl_hit=True with trade_closed=False should have no extra effect."""
+        r_sl_no_close   = compute_step_reward(**self._base(sl_hit=True))
+        r_no_sl_no_close = compute_step_reward(**self._base())
+        assert r_sl_no_close == pytest.approx(r_no_sl_no_close, rel=1e-8)
+
+    def test_dd_above_5pct_always_penalises(self):
+        """With dd=0.08 (above threshold), every step should have a penalty."""
+        r_dd_above = compute_step_reward(**self._base(current_drawdown=0.08))
+        r_dd_below = compute_step_reward(**self._base(current_drawdown=0.04))
+        assert r_dd_above < r_dd_below, (
+            f"Above-threshold dd should penalise more: {r_dd_above:.5f} vs {r_dd_below:.5f}"
+        )
+
+    def test_dd_penalty_proportional(self):
+        """Higher DD → worse per-step reward (proportionality test)."""
+        dds   = [0.06, 0.09, 0.12]
+        rwds  = [compute_step_reward(**self._base(current_drawdown=d)) for d in dds]
+        for i in range(1, len(rwds)):
+            assert rwds[i] < rwds[i-1], f"Reward should decrease with DD: {rwds}"
+
+    def test_sl_and_dd_combine_additively(self):
+        """SL sting + drawdown penalty are additive, not competing."""
+        r_only_sl = compute_step_reward(**self._base(
+            trade_closed=True, realized_pnl_pct=-0.03, sl_hit=True, current_drawdown=0.0
+        ))
+        r_only_dd = compute_step_reward(**self._base(
+            trade_closed=True, realized_pnl_pct=-0.03, sl_hit=False, current_drawdown=0.10
+        ))
+        r_both = compute_step_reward(**self._base(
+            trade_closed=True, realized_pnl_pct=-0.03, sl_hit=True, current_drawdown=0.10
+        ))
+        # r_both should be worse than either alone
+        assert r_both < r_only_sl
+        assert r_both < r_only_dd

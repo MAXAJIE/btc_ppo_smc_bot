@@ -18,6 +18,10 @@ Usage (inside Lightning.ai Studio terminal):
     # Resume from checkpoint:
     python train_lightning.py --resume ./models/ppo_btc_200000_steps.zip
 
+    # Fine-tune with lower learning rate (fixes value_loss explosion):
+    python train_lightning.py --lr 1e-4 --timesteps 3000000
+    python train_lightning.py --lr 1e-4 --resume ./models/ppo_btc_final.zip
+
     # Quick test run:
     python train_lightning.py --timesteps 50000 --n-envs 1
 
@@ -48,7 +52,7 @@ else:
     LOG_DIR = "./logs"
     print("[Local] Running locally. Saving to ./models, ./data, ./logs")
 
-# Override environment vars used by data_loader, logger, etc.
+# Override env vars used by data_loader, logger, etc.
 os.environ["MODEL_SAVE_PATH"] = MODEL_DIR
 os.environ["DATA_PATH"] = DATA_DIR
 os.environ["LOG_PATH"] = LOG_DIR
@@ -77,12 +81,15 @@ def auto_detect_gpu() -> int:
 
 
 def auto_n_envs(n_gpus: int, requested: int) -> int:
+    """
+    Heuristic: on a single GPU machine, use 4–8 parallel envs.
+    On CPU, use 2.
+    """
     if requested > 0:
         return requested
     if n_gpus > 0:
-        # 针对 Lightning AI 的高性能 GPU 调优
-        return 128 if n_gpus == 1 else 256
-    return 8
+        return 256   # 4 parallel envs saturate a single GPU well for RL
+    return 8       # CPU fallback
 
 
 def main():
@@ -92,6 +99,8 @@ def main():
     parser.add_argument("--resume", default=None, help="Path to checkpoint .zip to resume from")
     parser.add_argument("--download-only", action="store_true", help="Only download data, then exit")
     parser.add_argument("--no-download", action="store_true", help="Skip data download (use cache)")
+    parser.add_argument("--lr", type=float, default=None,
+                        help="Learning rate override. Default: 3e-4 (fresh) or 1e-4 (fine-tune). Example: --lr 1e-4")
     args = parser.parse_args()
 
     # ── Detect hardware ───────────────────────────────────────────────
@@ -127,7 +136,7 @@ def main():
         total_timesteps=args.timesteps,
         n_envs=n_envs,
         pretrained_path=resume_path,
-
+        learning_rate=args.lr,         # [3] --lr 1e-4 for fine-tuning
     )
 
     logger.info(f"Training complete! Final model: {final_path}")

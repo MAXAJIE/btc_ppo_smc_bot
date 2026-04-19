@@ -33,7 +33,7 @@ def _load_cfg():
 
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_ppo(env, cfg=None) -> PPO:
+def build_ppo(env, cfg=None, learning_rate: float = None) -> PPO:
     """
     Create a new PPO model with config-driven hyperparameters.
 
@@ -63,10 +63,13 @@ def build_ppo(env, cfg=None) -> PPO:
         "activation_fn": act_fn,
     }
 
+    # Resolve learning rate: CLI override → config → default 3e-4
+    lr = learning_rate if learning_rate is not None else ppo_cfg.get("initial_lr", ppo_cfg["learning_rate"])
+
     model = PPO(
         policy=ppo_cfg["policy"],
         env=env,
-        learning_rate=ppo_cfg["learning_rate"],
+        learning_rate=lr,
         n_steps=ppo_cfg["n_steps"],
         batch_size=ppo_cfg["batch_size"],
         n_epochs=ppo_cfg["n_epochs"],
@@ -84,13 +87,21 @@ def build_ppo(env, cfg=None) -> PPO:
     logger.info(
         f"PPO created | policy={ppo_cfg['policy']} "
         f"net_arch={ppo_cfg['policy_kwargs']['net_arch']} "
-        f"lr={ppo_cfg['learning_rate']}"
+        f"lr={lr}"
     )
     return model
 
 
+def update_lr(model: PPO, new_lr: float):
+    """Hot-swap learning rate on an already-built model (used for fine-tuning)."""
+    model.learning_rate = new_lr
+    # SB3 uses a schedule callable; replace with a constant
+    model.lr_schedule = lambda _: new_lr
+    logger.info(f"Learning rate updated to {new_lr}")
+
+
 def load_ppo(path: str, env) -> PPO:
-    """Load a saved PPO model and attach a new environment."""
+    """Load a saved PPO model and attach a new env."""
     model = PPO.load(path, env=env, device="auto")
     logger.info(f"PPO loaded from {path}")
     return model
@@ -120,7 +131,7 @@ def make_callbacks(model_dir: str, eval_env=None, save_freq: int = 100_000) -> l
     )
     callbacks.append(ckpt_cb)
 
-    # Eval callback (if eval environment provided)
+    # Eval callback (if eval env provided)
     if eval_env is not None:
         eval_cb = EvalCallback(
             eval_env,

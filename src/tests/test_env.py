@@ -505,3 +505,274 @@ class TestHoldingCostInEnv:
             f"In-trade total {total_in_trade:.4f} should not exceed flat {total_flat:.4f} "
             f"when unrealised PnL is small (holding cost should pull it lower)"
         )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# v3 ADDITIONS
+# ═════════════════════════════════════════════════════════════════════════════
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [1] SL-hit extra penalty integration — env passes sl_hit=True correctly
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestSLPenaltyInEnv:
+    """
+    Verify that when SL fires in the environment the reward is meaningfully
+    worse than when the agent voluntarily closes at the same price.
+    """
+
+    def _make_env(self, loader, tmp_path):
+        from src.env.binance_testnet_env import BTCFuturesEnv
+        from src.utils.logger import TradeLogger
+        return BTCFuturesEnv(
+            data_loader=loader, mode="offline",
+            trade_logger=TradeLogger(log_dir=str(tmp_path)),
+            episode_idx=600,
+        )
+
+    def test_sl_trigger_reward_worse_than_voluntary_close(self, loader, tmp_path):
+        """
+        Open a long, force SL to fire, compare reward to voluntary close
+        at same entry price.  SL reward must be lower by ~sl_hit_extra_penalty.
+        """
+        # Scenario A: SL fires (set sl_price above current price)
+        envA = self._make_env(loader, tmp_path)
+        envA.reset()
+        envA.step(1)                          # open long
+        envA._sl_price = envA._current_price() * 1.5   # force SL on next step
+        _, rA, _, _, infoA = envA.step(0)    # HOLD — SL fires
+
+        # Scenario B: agent voluntarily closes at same step
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp2:
+            envB = self._make_env(loader, tmp2)
+            envB.reset()
+            # Open at same idx
+            envB._cur_idx = envA._cur_idx - 1
+            envB.step(1)
+            envB._entry_price = envA._entry_price   # sync entry
+            envB._sl_price = 0.0                    # disable SL
+            envB._tp_price = 1e10                   # disable TP
+            _, rB, _, _, infoB = envB.step(5)       # CLOSE
+
+        # SL reward should be worse than voluntary close
+        assert rA < rB, (
+            f"SL reward {rA:.4f} should be worse than voluntary close {rB:.4f}"
+        )
+
+    def test_tp_reward_not_penalised(self, loader, tmp_path):
+        """TP hit should NOT incur sl_hit penalty — only SL does."""
+        env = self._make_env(loader, tmp_path)
+        env.reset()
+        env.step(1)                                          # open long
+        env._tp_price = env._current_price() * 0.5          # force TP on next step
+        _, r_tp, _, _, _ = env.step(0)                      # HOLD — TP fires
+
+        env.reset()
+        env.step(1)
+        env._sl_price = env._current_price() * 1.5          # force SL
+        _, r_sl, _, _, _ = env.step(0)
+
+        # Both close at a loss in this setup, but SL should be worse
+        assert r_sl < r_tp, (
+            f"SL reward {r_sl:.4f} should be worse than TP reward {r_tp:.4f}"
+        )
+
+    def test_sl_flag_in_info(self, loader, tmp_path):
+        """trade_closed should be True when SL fires."""
+        env = self._make_env(loader, tmp_path)
+        env.reset()
+        env.step(1)
+        env._sl_price = env._current_price() * 1.5
+        _, _, _, _, info = env.step(0)
+        assert info["trade_closed"] is True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [2] reset_normalizers called on env.reset()
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestNormalizerResetOnEnvReset:
+    """
+    Verify that env.reset() calls reset_normalizers(), clearing inter-episode
+    statistical bleed from the SMC RunningZScore buffers.
+    """
+
+    def test_reset_clears_smc_buffers(self, loader, tmp_path):
+        """After env.reset(), SMC normaliser buffers should be empty."""
+        from src.env.binance_testnet_env import BTCFuturesEnv
+        from src.utils.logger import TradeLogger
+        from src.features.smc_features import _NORMALIZERS, _get_norm
+
+        env = BTCFuturesEnv(
+            data_loader=loader, mode="offline",
+            trade_logger=TradeLogger(log_dir=str(tmp_path)),
+            episode_idx=600,
+        )
+
+        # Pre-populate some normalizers (simulating a previous episode)
+        for i in [0, 1, 6, 7]:
+            n = _get_norm("5m", i)
+            for v in np.linspace(0, 1, 50):
+                n.normalise(v)
+
+        # Verify they have data
+        bufs_before = [len(_get_norm("5m", i)._buf) for i in [0, 1, 6, 7]]
+        assert any(b > 0 for b in bufs_before), "Should have data before reset"
+
+        # Reset the environment
+        env.reset()
+
+        # All SMC normalizer buffers should now be empty
+        bufs_after = [len(_get_norm("5m", i)._buf) for i in [0, 1, 6, 7]]
+        assert all(b == 0 for b in bufs_after), (
+            f"Buffers should be empty after env.reset(), got: {bufs_after}"
+        )
+
+    def test_multiple_resets_independent(self, loader, tmp_path):
+        """Each reset should produce a fresh normalizer state."""
+        from src.env.binance_testnet_env import BTCFuturesEnv
+        from src.utils.logger import TradeLogger
+        from src.features.smc_features import _get_norm
+
+        env = BTCFuturesEnv(
+            data_loader=loader, mode="offline",
+            trade_logger=TradeLogger(log_dir=str(tmp_path)),
+            episode_idx=600,
+        )
+
+        for _ in range(3):
+            env.reset()
+            # Immediately after reset, normalizer should be in warm-up
+            n = _get_norm("5m", 0)
+            assert len(n._buf) == 0, "Buffer should be empty right after reset"
+            # Feed a value — should return raw (warm-up mode)
+            raw_out = n.normalise(0.6)
+            assert raw_out == pytest.approx(0.6, rel=1e-5)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [1] Per-step drawdown penalty accumulates in env
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestDrawdownPenaltyInEnv:
+    """
+    Verify that the per-step drawdown penalty fires in the environment and
+    accumulates over multiple steps while account is in drawdown.
+    """
+
+    def _make_env(self, loader, tmp_path):
+        from src.env.binance_testnet_env import BTCFuturesEnv
+        from src.utils.logger import TradeLogger
+        return BTCFuturesEnv(
+            data_loader=loader, mode="offline",
+            trade_logger=TradeLogger(log_dir=str(tmp_path)),
+            episode_idx=600,
+        )
+
+    def test_drawdown_penalises_every_step_above_threshold(self, loader, tmp_path):
+        """Reward at 8% drawdown should be lower than at 0% drawdown, every step."""
+        env = self._make_env(loader, tmp_path)
+
+        # Collect reward at zero drawdown
+        env.reset()
+        rewards_no_dd = []
+        for _ in range(10):
+            _, r, term, trunc, _ = env.step(0)
+            if term or trunc: break
+            rewards_no_dd.append(r)
+
+        # Collect reward at 8% drawdown (flat position, same actions)
+        env.reset()
+        env._peak_equity = 10000.0
+        env._balance     = 9200.0   # 8% drawdown
+        env._equity      = 9200.0
+        rewards_dd = []
+        for _ in range(10):
+            _, r, term, trunc, _ = env.step(0)
+            if term or trunc: break
+            rewards_dd.append(r)
+
+        mean_no_dd = np.mean(rewards_no_dd) if rewards_no_dd else 0
+        mean_dd    = np.mean(rewards_dd)    if rewards_dd    else 0
+        assert mean_dd < mean_no_dd, (
+            f"Mean reward with drawdown ({mean_dd:.5f}) should be lower "
+            f"than without ({mean_no_dd:.5f})"
+        )
+
+    def test_deeper_drawdown_worse_per_step(self, loader, tmp_path):
+        """10% drawdown should give worse step reward than 6% drawdown."""
+        env = self._make_env(loader, tmp_path)
+
+        def collect_reward_at_dd(dd_pct):
+            env.reset()
+            env._peak_equity = 10000.0
+            env._balance     = 10000.0 * (1 - dd_pct)
+            env._equity      = env._balance
+            _, r, _, _, _ = env.step(0)
+            return r
+
+        r_6pct  = collect_reward_at_dd(0.06)
+        r_10pct = collect_reward_at_dd(0.10)
+        assert r_10pct < r_6pct, (
+            f"10% DD reward {r_10pct:.5f} should be worse than 6% DD {r_6pct:.5f}"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [3] Learning rate argument flows through to PPO
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestLearningRate:
+
+    def test_build_ppo_accepts_lr_override(self, loader, tmp_path):
+        """build_ppo(learning_rate=1e-4) should create a model with that LR."""
+        import sys, types
+        for m in ['stable_baselines3']:
+            if m not in sys.modules:
+                sys.modules[m] = types.ModuleType(m)
+
+        try:
+            from src.models.ppo_model import build_ppo
+        except ImportError:
+            pytest.skip("stable_baselines3 not installed")
+
+        from stable_baselines3.common.vec_env import DummyVecEnv
+        from stable_baselines3.common.monitor import Monitor
+        from src.env.binance_testnet_env import BTCFuturesEnv
+        from src.utils.logger import TradeLogger
+
+        env = DummyVecEnv([lambda: Monitor(BTCFuturesEnv(
+            data_loader=loader, mode="offline",
+            trade_logger=TradeLogger(log_dir=str(tmp_path)),
+            episode_idx=600,
+        ))])
+
+        model = build_ppo(env, learning_rate=1e-4)
+        # SB3 stores lr as a callable schedule; call it with step=0
+        actual_lr = model.lr_schedule(0)
+        assert actual_lr == pytest.approx(1e-4, rel=1e-5), (
+            f"Expected lr=1e-4, got {actual_lr}"
+        )
+
+    def test_update_lr_changes_rate(self, loader, tmp_path):
+        """update_lr() helper should hot-swap the learning rate."""
+        try:
+            from src.models.ppo_model import build_ppo, update_lr
+        except ImportError:
+            pytest.skip("stable_baselines3 not installed")
+
+        from stable_baselines3.common.vec_env import DummyVecEnv
+        from stable_baselines3.common.monitor import Monitor
+        from src.env.binance_testnet_env import BTCFuturesEnv
+        from src.utils.logger import TradeLogger
+
+        env = DummyVecEnv([lambda: Monitor(BTCFuturesEnv(
+            data_loader=loader, mode="offline",
+            trade_logger=TradeLogger(log_dir=str(tmp_path)),
+            episode_idx=600,
+        ))])
+
+        model = build_ppo(env, learning_rate=3e-4)
+        update_lr(model, 1e-4)
+        assert model.lr_schedule(0) == pytest.approx(1e-4, rel=1e-5)

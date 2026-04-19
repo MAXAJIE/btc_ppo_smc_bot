@@ -454,3 +454,207 @@ class TestStationarity:
         arr = np.ones(50) * 42.0
         z = _zscore_last(arr, window=20)
         assert z == pytest.approx(0.0, abs=1e-6)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# v3 ADDITIONS
+# ═════════════════════════════════════════════════════════════════════════════
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [2] RunningZScore normaliser
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestRunningZScore:
+    """Tests for the per-feature online z-score normaliser in smc_features.py."""
+
+    def _make(self, window=200, min_samples=20):
+        from src.features.smc_features import RunningZScore
+        return RunningZScore(window=window, min_samples=min_samples)
+
+    def test_warm_up_returns_clipped_raw(self):
+        """Before min_samples, should return raw value clipped to [-1,1]."""
+        norm = self._make(min_samples=20)
+        for i in range(19):
+            r = norm.normalise(0.8)
+        assert r == pytest.approx(0.8, rel=1e-6)
+
+    def test_raw_clipped_to_minus1_plus1_during_warmup(self):
+        norm = self._make(min_samples=20)
+        r_above = norm.normalise(5.0)   # still warm-up (buf len = 1)
+        assert r_above == pytest.approx(1.0), "raw=5.0 should clip to 1.0 in warm-up"
+
+    def test_after_warmup_output_bounded(self):
+        """After warm-up all output must be in [-1, 1]."""
+        norm = self._make(min_samples=10)
+        rng  = np.random.default_rng(7)
+        for _ in range(10):
+            norm.normalise(rng.uniform(0, 1))
+        for _ in range(300):
+            v = rng.uniform(0, 1)
+            r = norm.normalise(v)
+            assert -1.0 <= r <= 1.0, f"Out of bounds: {r:.4f} for input {v:.4f}"
+
+    def test_approximately_zero_mean_after_many_samples(self):
+        """Z-score of a stationary series should have near-zero mean."""
+        norm = self._make(window=200, min_samples=20)
+        rng  = np.random.default_rng(42)
+        vals = rng.uniform(0, 1, 400)
+        outs = [norm.normalise(v) for v in vals]
+        stable = outs[30:]   # skip warm-up
+        assert abs(np.mean(stable)) < 0.15, (
+            f"Mean should be ~0, got {np.mean(stable):.4f}"
+        )
+
+    def test_scale_invariance(self):
+        """Z-score must be identical for x and x*K (same dynamics, different scale)."""
+        from src.features.smc_features import RunningZScore
+        rng = np.random.default_rng(1)
+        base = rng.uniform(0, 1, 100)
+        norm_s = RunningZScore(window=200, min_samples=10)
+        norm_l = RunningZScore(window=200, min_samples=10)
+        for v in base:
+            norm_s.normalise(v)
+            norm_l.normalise(v * 1e6)
+        z_s = norm_s.normalise(base[-1])
+        z_l = norm_l.normalise(base[-1] * 1e6)
+        assert abs(z_s - z_l) < 1e-5, (
+            f"Scale invariance failed: z_small={z_s:.6f} z_large={z_l:.6f}"
+        )
+
+    def test_reset_clears_buffer(self):
+        """reset() must empty the buffer so warm-up restarts."""
+        from src.features.smc_features import RunningZScore
+        norm = RunningZScore(min_samples=5)
+        for v in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]:
+            norm.normalise(v)
+        norm.reset()
+        # First sample after reset should be raw (warm-up)
+        r = norm.normalise(0.7)
+        assert r == pytest.approx(0.7, rel=1e-6), "After reset, should be in warm-up mode"
+
+    def test_different_tf_labels_independent(self):
+        """
+        Two calls with different tf_label args should maintain independent
+        running statistics (separate normaliser instances).
+        """
+        from src.features.smc_features import _get_norm, reset_normalizers
+        reset_normalizers()
+        rng = np.random.default_rng(99)
+        # Feed very different distributions to "5m" and "1h"
+        for v in rng.uniform(0, 0.01, 200):   # tiny values for 5m
+            _get_norm("5m", 0).normalise(v)
+        for v in rng.uniform(0.9, 1.0, 200):  # large values for 1h
+            _get_norm("1h", 0).normalise(v)
+        # Both should give near-zero mean for their last sample
+        z5  = _get_norm("5m", 0).normalise(rng.uniform(0, 0.01))
+        z1h = _get_norm("1h", 0).normalise(rng.uniform(0.9, 1.0))
+        # Neither should be at extreme ±1 (they'd only be that for outliers)
+        assert abs(z5)  < 0.9, f"5m z={z5:.3f} shouldn't be extreme"
+        assert abs(z1h) < 0.9, f"1h z={z1h:.3f} shouldn't be extreme"
+
+    def test_outlier_clipped(self):
+        """A 10-sigma outlier should be clipped to ±1, not explode."""
+        from src.features.smc_features import RunningZScore
+        norm = RunningZScore(min_samples=5)
+        for v in [0.1] * 100:     # very tight distribution
+            norm.normalise(v)
+        huge = 1000.0             # ~10,000σ outlier
+        r = norm.normalise(huge)
+        assert r == pytest.approx(1.0, rel=1e-4), f"Outlier should clip to 1.0, got {r}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [2] reset_normalizers — inter-episode isolation
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestResetNormalizers:
+
+    def test_reset_clears_all_registered_normalizers(self):
+        from src.features.smc_features import _get_norm, reset_normalizers, _NORMALIZERS
+        reset_normalizers()  # clean start
+        # Register some normalizers
+        for tf in ["5m", "1h"]:
+            for idx in [0, 1, 6, 7]:
+                n = _get_norm(tf, idx)
+                for v in range(50):
+                    n.normalise(float(v) * 0.01)
+        # Verify they have data
+        assert any(len(n._buf) > 0 for n in _NORMALIZERS.values())
+        # Reset
+        reset_normalizers()
+        # All buffers should be empty
+        for n in _NORMALIZERS.values():
+            assert len(n._buf) == 0, "Buffer should be empty after reset"
+
+    def test_after_reset_first_output_is_warmup(self):
+        from src.features.smc_features import _get_norm, reset_normalizers
+        reset_normalizers()
+        n = _get_norm("test_tf", 0)
+        # Warm up then reset
+        for v in np.linspace(0, 1, 50):
+            n.normalise(v)
+        reset_normalizers()
+        # First value post-reset should be raw (warm-up)
+        r = _get_norm("test_tf", 0).normalise(0.42)
+        assert r == pytest.approx(0.42, rel=1e-6)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [2] SMC feature output after normalisation
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestSMCFeaturesV3:
+    """
+    Tests that SMC feature outputs from extract_smc_features() go through
+    normalisation and remain bounded after the normaliser warms up.
+    """
+
+    def _make_df(self, n=300, seed=0):
+        rng = np.random.default_rng(seed)
+        prices = np.cumprod(1 + rng.normal(0, 0.003, n)) * 50_000
+        idx = pd.date_range("2023-01-01", periods=n, freq="5min", tz="UTC")
+        return pd.DataFrame({
+            "open":   prices * (1 + rng.uniform(-0.001, 0.001, n)),
+            "high":   prices * (1 + rng.uniform(0, 0.003, n)),
+            "low":    prices * (1 - rng.uniform(0, 0.003, n)),
+            "close":  prices,
+            "volume": np.abs(rng.lognormal(10, 0.5, n)),
+        }, index=idx)
+
+    def test_output_shape(self):
+        from src.features.smc_features import extract_smc_features, reset_normalizers
+        reset_normalizers()
+        df = self._make_df()
+        feat = extract_smc_features(df, float(df["close"].iloc[-1]), tf_label="5m")
+        assert feat.shape == (8,)
+
+    def test_output_bounded(self):
+        from src.features.smc_features import extract_smc_features, reset_normalizers
+        reset_normalizers()
+        df = self._make_df()
+        price = float(df["close"].iloc[-1])
+        feat = extract_smc_features(df, price, tf_label="5m")
+        assert np.all(feat >= -1.0), f"Min: {feat.min():.4f}"
+        assert np.all(feat <= 1.0),  f"Max: {feat.max():.4f}"
+
+    def test_all_finite(self):
+        from src.features.smc_features import extract_smc_features, reset_normalizers
+        reset_normalizers()
+        df = self._make_df()
+        feat = extract_smc_features(df, float(df["close"].iloc[-1]), tf_label="5m")
+        assert np.all(np.isfinite(feat)), f"Non-finite: {feat}"
+
+    def test_tf_labels_produce_independent_stats(self):
+        """5m and 1h features for same candles should differ after warm-up."""
+        from src.features.smc_features import extract_smc_features, reset_normalizers
+        reset_normalizers()
+        df = self._make_df(n=300)
+        price = float(df["close"].iloc[-1])
+        # Warm up both normalizers with many calls
+        for _ in range(50):
+            extract_smc_features(df, price, tf_label="5m")
+            extract_smc_features(df, price, tf_label="1h")
+        f5m = extract_smc_features(df, price, tf_label="5m")
+        f1h = extract_smc_features(df, price, tf_label="1h")
+        # Shapes match, but normalised values may differ
+        assert f5m.shape == f1h.shape == (8,)

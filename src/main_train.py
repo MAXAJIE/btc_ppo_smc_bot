@@ -46,7 +46,7 @@ def load_cfg():
 
 
 def make_env(data_loader: DataLoader, trade_logger: TradeLogger, seed: int = 0):
-    """Factory function for vectorised environment creation."""
+    """Factory function for vectorised env creation."""
     def _init():
         env = BTCFuturesEnv(
             data_loader=data_loader,
@@ -64,6 +64,7 @@ def main(
     total_timesteps: int = None,
     n_envs: int = 1,
     pretrained_path: str = None,
+    learning_rate: float = None,   # [3] CLI --lr override
 ):
     cfg = load_cfg()
     offline_cfg = cfg["offline"]
@@ -100,7 +101,7 @@ def main(
     else:
         env = SubprocVecEnv([make_env(loader, trade_logger, seed=i) for i in range(n_envs)])
 
-    # Eval environment (single, deterministic)
+    # Eval env (single, deterministic)
     eval_env = DummyVecEnv([make_env(loader, TradeLogger())])
 
     # ── 3. Build or load model ────────────────────────────────────────
@@ -108,9 +109,16 @@ def main(
         logger.info(f"Loading pretrained model from {pretrained_path}")
         from src.models.ppo_model import load_ppo
         model = load_ppo(pretrained_path, env=env)
+        # Apply LR override/fine-tune schedule on loaded model
+        effective_lr = learning_rate or cfg["ppo"].get("fine_tune_lr", 1e-4)
+        from src.models.ppo_model import update_lr
+        update_lr(model, effective_lr)
     else:
         logger.info("Building new PPO model...")
-        model = build_ppo(env, cfg=cfg)
+        # Resolve LR: explicit arg → config fine_tune_lr (if resuming) → initial_lr
+        if learning_rate is None and pretrained_path:
+            learning_rate = cfg["ppo"].get("fine_tune_lr", 1e-4)
+        model = build_ppo(env, cfg=cfg, learning_rate=learning_rate)
 
     # ── 4. Callbacks ─────────────────────────────────────────────────
     callbacks = make_callbacks(
@@ -154,6 +162,7 @@ if __name__ == "__main__":
     parser.add_argument("--timesteps", type=int, default=None)
     parser.add_argument("--n-envs", type=int, default=1)
     parser.add_argument("--pretrained", default=None, help="Path to .zip model to continue from")
+    parser.add_argument("--lr", type=float, default=None, help="Learning rate override (e.g. 1e-4)")
     args = parser.parse_args()
 
     main(
@@ -162,4 +171,5 @@ if __name__ == "__main__":
         total_timesteps=args.timesteps,
         n_envs=args.n_envs,
         pretrained_path=args.pretrained,
+        learning_rate=args.lr,
     )

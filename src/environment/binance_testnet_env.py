@@ -34,11 +34,10 @@ import yaml
 import os
 
 from ..features.multi_tf_features import build_observation, OBS_DIM
+from ..features.smc_features import reset_normalizers as _reset_smc_normalizers
 from ..features.garch_kelly import GarchKellyEstimator, kelly_position_size
 from ..utils.reward import compute_step_reward, cost_penalty, funding_cost, killswitch_penalty
 from ..utils.websocket_feed import WebSocketCandleFeed, RESTCandleFeed
-from src.utils.logger import TradeLogger
-
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +145,7 @@ class BTCFuturesEnv(gym.Env):
 
         self._episode_counter += 1
         self._reset_state()
+        _reset_smc_normalizers()   # [2] clear SMC z-score buffers between episodes
 
         if self.mode == "offline":
             self._cur_idx = self._pick_episode_start()
@@ -176,6 +176,7 @@ class BTCFuturesEnv(gym.Env):
         realized_pnl_pct = 0.0
         tx_cost = 0.0
         fund_fee = 0.0
+        sl_hit = False          # [1] tracks whether SL specifically triggered
 
         prev_price = self._current_price()
 
@@ -202,11 +203,12 @@ class BTCFuturesEnv(gym.Env):
 
         # ── Hard stop-loss / take-profit check ───────────────────────
         if self._position != 0:
-            sl_hit, tp_hit = self._check_sl_tp(cur_price)
-            if sl_hit or tp_hit:
-                reason = "SL" if sl_hit else "TP"
+            _sl_triggered, tp_hit = self._check_sl_tp(cur_price)
+            if _sl_triggered or tp_hit:
+                reason = "SL" if _sl_triggered else "TP"
                 realized_pnl_pct = self._close_position(cur_price, reason)
                 trade_closed = True
+                sl_hit = _sl_triggered     # [1] remember if SL specifically fired
                 tx_cost = cost_penalty(self._notional, self._balance)
 
         # ── Max bars in trade check ───────────────────────────────────
@@ -268,6 +270,7 @@ class BTCFuturesEnv(gym.Env):
             transaction_cost=tx_cost,
             funding_fee=fund_fee,
             kill_triggered=kill_triggered,    # [A] punitive penalty
+            sl_hit=sl_hit,                    # [1] extra SL sting
         )
 
         # ── Observation ──────────────────────────────────────────────
