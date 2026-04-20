@@ -44,7 +44,7 @@ import yaml
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 
-from src.env.binance_testnet_env import BinanceEnv
+from src.environment.binance_testnet_env import BinanceEnv
 from src.utils.data_loader       import DataLoader
 from src.utils.logger            import TradeLogger
 from src.models.ppo_model        import (
