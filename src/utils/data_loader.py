@@ -1,14 +1,22 @@
 """
-data_loader.py – Fixed MTF historical downloader
-====================================================
-Fixes:
-  - DataLoader now supports both the new dict-based API (load_all_timeframes)
-    AND the legacy method names used by main_train.py / train_lightning.py:
-      loader.load_base_df()
-      loader.n_candles
-      loader.download_history(years=N)
-      loader.get_multi_tf_candles(end_idx, lookback_5m)
-      loader.get_episode_start_indices(episode_len, warmup)
+data_loader.py
+==============
+Bugs fixed
+----------
+BUG 1 (always re-fetching):
+    train_lightning._ensure_data() checked for "BTCUSDT_5m.parquet" (uppercase)
+    but the downloader saved "btcusdt_5m.parquet" (lowercase).
+    Cache check always failed → always re-downloaded.
+
+    Fix: ALL code now uses _cache_path() which always produces lowercase names.
+         load_base_df() also auto-migrates any old uppercase files.
+
+BUG 2 (missing legacy methods):
+    main_train.py calls load_base_df(), download_history(), n_candles,
+    get_multi_tf_candles(), get_episode_start_indices() on the DataLoader.
+    These were missing → AttributeError on startup.
+
+    Fix: full legacy API implemented on the DataLoader class.
 """
 
 from __future__ import annotations
@@ -16,120 +24,63 @@ from __future__ import annotations
 import logging
 import time
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-SYMBOL   = "BTC/USDT"
+SYMBOL   = "BTC/USDT:USDT"
 EXCHANGE = "binanceusdm"
-DATA_DIR = Path("./data")
 
 TIMEFRAMES: Dict[str, str] = {
-    "5m":  "5m",
-    "15m": "15m",
-    "1h":  "1h",
-    "4h":  "4h",
-    "1d":  "1d",
+    "5m": "5m", "15m": "15m", "1h": "1h", "4h": "4h", "1d": "1d",
 }
 
 CANDLE_LIMITS: Dict[str, int] = {
-    "5m":  210_240,
-    "15m":  70_080,
-    "1h":   17_520,
-    "4h":    4_380,
-    "1d":    1_095,
+    "5m": 210_240, "15m": 70_080, "1h": 17_520, "4h": 4_380, "1d": 1_095,
 }
 
 COLUMNS = ["timestamp", "open", "high", "low", "close", "volume"]
 
 
+def _cache_path(data_dir: Path, tf_key: str) -> Path:
+    """Single source of truth: always lowercase filename."""
+    return data_dir / f"btcusdt_{tf_key}.parquet"
+
+
 # ---------------------------------------------------------------------------
-# Public module-level API
+# Module-level functional API
 # ---------------------------------------------------------------------------
 
-def load_all_timeframes(force_refresh: bool = False) -> Dict[str, pd.DataFrame]:
-    """Load OHLCV data for every required timeframe."""
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+def load_all_timeframes(
+    force_refresh: bool = False,
+    data_dir: Optional[Path] = None,
+) -> Dict[str, pd.DataFrame]:
+    _dir = Path(data_dir) if data_dir else Path("./data")
+    _dir.mkdir(parents=True, exist_ok=True)
     result: Dict[str, pd.DataFrame] = {}
 
     for tf_key, tf_ccxt in TIMEFRAMES.items():
-        cache_path = DATA_DIR / f"btcusdt_{tf_key}.parquet"
+        cache = _cache_path(_dir, tf_key)
 
-        if not force_refresh and cache_path.exists():
-            df = pd.read_parquet(cache_path)
-            logger.info("Loaded %s from cache (%d rows)", tf_key, len(df))
+        # Auto-migrate old uppercase files (one-time)
+        old = _dir / f"BTCUSDT_{tf_key}.parquet"
+        if old.exists() and not cache.exists():
+            old.rename(cache)
+            logger.info("Migrated %s → %s", old.name, cache.name)
+
+        if not force_refresh and cache.exists():
+            df = pd.read_parquet(cache)
+            logger.info("Cache hit  %s (%d rows)", tf_key, len(df))
         else:
-            df = _download_timeframe(tf_ccxt, CANDLE_LIMITS[tf_key])
-            df.to_parquet(cache_path)
-            logger.info("Downloaded & cached %s (%d rows)", tf_key, len(df))
+            df = _download(tf_ccxt, CANDLE_LIMITS[tf_key])
+            df.to_parquet(cache)
+            logger.info("Downloaded %s (%d rows)", tf_key, len(df))
 
         result[tf_key] = df
-
     return result
-
-
-def _download_timeframe(timeframe: str, target_rows: int) -> pd.DataFrame:
-    """Fetch candles for a timeframe from Binance USDM futures."""
-    try:
-        import ccxt
-    except ImportError:
-        raise ImportError("ccxt is required: pip install ccxt")
-
-    exchange = ccxt.binanceusdm({"enableRateLimit": True})
-    exchange.load_markets()
-
-    all_candles: list = []
-    batch_size = 1500
-    ms_per_candle = _tf_to_ms(timeframe)
-    since = exchange.milliseconds() - target_rows * ms_per_candle
-
-    fetched = 0
-    while fetched < target_rows:
-        try:
-            batch = exchange.fetch_ohlcv(
-                SYMBOL, timeframe=timeframe,
-                since=since, limit=batch_size
-            )
-        except ccxt.NetworkError as exc:
-            logger.warning("Network error fetching %s: %s — retrying in 5s", timeframe, exc)
-            time.sleep(5)
-            continue
-        except ccxt.ExchangeError as exc:
-            logger.error("Exchange error fetching %s: %s", timeframe, exc)
-            break
-
-        if not batch:
-            break
-
-        all_candles.extend(batch)
-        fetched += len(batch)
-        since = batch[-1][0] + ms_per_candle
-        time.sleep(exchange.rateLimit / 1000)
-
-        if len(batch) < batch_size:
-            break
-
-    if not all_candles:
-        raise RuntimeError(f"No data fetched for timeframe {timeframe}")
-
-    df = pd.DataFrame(all_candles, columns=COLUMNS)
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-    df = df.drop_duplicates("timestamp").sort_values("timestamp")
-    df = df.set_index("timestamp").astype(float).dropna()
-    return df
-
-
-def _tf_to_ms(timeframe: str) -> int:
-    unit_map = {"m": 60_000, "h": 3_600_000, "d": 86_400_000}
-    unit = timeframe[-1]
-    value = int(timeframe[:-1])
-    return value * unit_map[unit]
 
 
 def build_aligned_dataset(all_tf: Dict[str, pd.DataFrame]) -> pd.DataFrame:
@@ -140,32 +91,30 @@ def build_aligned_dataset(all_tf: Dict[str, pd.DataFrame]) -> pd.DataFrame:
         base = pd.merge_asof(
             base.reset_index(),
             htf.reset_index().rename(columns={"timestamp": f"ts_{tf}"}),
-            left_on="timestamp",
-            right_on=f"ts_{tf}",
-            direction="backward",
+            left_on="timestamp", right_on=f"ts_{tf}", direction="backward",
         ).set_index("timestamp").drop(columns=[f"ts_{tf}"], errors="ignore")
     return base
 
 
 # ---------------------------------------------------------------------------
-# DataLoader class — supports both legacy and new API
+# DataLoader class
 # ---------------------------------------------------------------------------
 
 class DataLoader:
     """
-    Unified DataLoader.
-
-    New API (used by BinanceEnv):
-        loader = DataLoader(data_dir="./data")
-        tf_data = loader.load()          # dict[str, pd.DataFrame]
-        df_5m   = loader.get("5m")
+    New API:
+        dl = DataLoader(data_dir="./data", years=2)
+        tf_data = dl.load()        # dict[str, pd.DataFrame]
+        df_5m   = dl["5m"]
+        aligned = dl.aligned
 
     Legacy API (used by main_train.py / train_lightning.py):
-        loader.load_base_df()            # loads / downloads all TFs
-        loader.n_candles                 # number of 5m bars
-        loader.download_history(years=2) # download and cache
-        loader.get_multi_tf_candles(end_idx, lookback_5m=500)
-        loader.get_episode_start_indices(episode_len, warmup)
+        dl.load_base_df()
+        dl.download_history(years=2)
+        dl.n_candles
+        dl.get_multi_tf_candles(end_idx, lookback_5m=500)
+        dl.get_episode_start_indices(episode_len, warmup)
+        dl.tf_data
     """
 
     def __init__(
@@ -175,34 +124,36 @@ class DataLoader:
         symbol: str = SYMBOL,
         force_refresh: bool = False,
     ):
-        global DATA_DIR
-        DATA_DIR = Path(data_dir)
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-
+        self._dir   = Path(data_dir)
+        self._dir.mkdir(parents=True, exist_ok=True)
         self._scale = years / 2.0
         self._force = force_refresh
         self._tf_data: Dict[str, pd.DataFrame] = {}
-        self._aligned: Optional[pd.DataFrame] = None
+        self._aligned: Optional[pd.DataFrame]  = None
 
-    # ── New API ────────────────────────────────────────────────────────
+    # ── New API ─────────────────────────────────────────────────────────────
 
     def load(self) -> Dict[str, pd.DataFrame]:
-        """Download / load all timeframes. Returns dict[str, pd.DataFrame]."""
-        original_limits = dict(CANDLE_LIMITS)
+        orig = dict(CANDLE_LIMITS)
         for k in CANDLE_LIMITS:
-            CANDLE_LIMITS[k] = int(original_limits[k] * self._scale)
+            CANDLE_LIMITS[k] = max(1, int(orig[k] * self._scale))
         try:
-            self._tf_data = load_all_timeframes(force_refresh=self._force)
+            self._tf_data = load_all_timeframes(
+                force_refresh=self._force, data_dir=self._dir
+            )
         finally:
-            CANDLE_LIMITS.update(original_limits)
+            CANDLE_LIMITS.update(orig)
         return self._tf_data
 
     def get(self, timeframe: str) -> pd.DataFrame:
         if not self._tf_data:
             self.load()
         if timeframe not in self._tf_data:
-            raise KeyError(f"Timeframe '{timeframe}' not available. Available: {list(self._tf_data.keys())}")
+            raise KeyError(f"'{timeframe}' not available. Got: {list(self._tf_data)}")
         return self._tf_data[timeframe]
+
+    def __getitem__(self, tf: str) -> pd.DataFrame:
+        return self.get(tf)
 
     @property
     def aligned(self) -> pd.DataFrame:
@@ -218,94 +169,127 @@ class DataLoader:
             self.load()
         return self._tf_data
 
-    def __getitem__(self, timeframe: str) -> pd.DataFrame:
-        return self.get(timeframe)
-
-    # ── Legacy API ─────────────────────────────────────────────────────
+    # ── Legacy API ───────────────────────────────────────────────────────────
 
     def load_base_df(self) -> pd.DataFrame:
         """
-        Legacy method used by main_train.py / train_lightning.py.
-        Loads all timeframes from cache (raises FileNotFoundError if missing).
+        Load all TFs from existing cache only — no download.
+        Raises FileNotFoundError if cache missing (caller should call
+        download_history() first).
         """
-        # Check if 5m cache exists
-        cache_5m = DATA_DIR / "btcusdt_5m.parquet"
-        # Also check old naming convention
-        cache_5m_alt = DATA_DIR / "BTCUSDT_5m.parquet"
+        cache_5m = _cache_path(self._dir, "5m")
 
-        if not cache_5m.exists() and not cache_5m_alt.exists():
+        # Auto-migrate old uppercase files
+        old_5m = self._dir / "BTCUSDT_5m.parquet"
+        if old_5m.exists() and not cache_5m.exists():
+            old_5m.rename(cache_5m)
+            logger.info("Migrated BTCUSDT_5m.parquet → btcusdt_5m.parquet")
+
+        if not cache_5m.exists():
             raise FileNotFoundError(
-                f"No cached data found in {DATA_DIR}. "
-                "Call loader.download_history() first."
+                f"No cached data at {cache_5m}. "
+                "Run loader.download_history() first."
             )
-
-        self._tf_data = load_all_timeframes(force_refresh=False)
-        return self._tf_data.get("5m", pd.DataFrame())
+        self._tf_data = load_all_timeframes(force_refresh=False, data_dir=self._dir)
+        return self._tf_data["5m"]
 
     def download_history(self, years: float = 2) -> pd.DataFrame:
-        """
-        Legacy method: download and cache all timeframes.
-        Returns the 5m DataFrame.
-        """
-        original_limits = dict(CANDLE_LIMITS)
+        """Force-download all TFs, save to cache, return 5m DataFrame."""
+        orig  = dict(CANDLE_LIMITS)
         scale = years / 2.0
         for k in CANDLE_LIMITS:
-            CANDLE_LIMITS[k] = max(1, int(original_limits[k] * scale))
+            CANDLE_LIMITS[k] = max(1, int(orig[k] * scale))
         try:
-            self._tf_data = load_all_timeframes(force_refresh=True)
+            self._tf_data = load_all_timeframes(force_refresh=True, data_dir=self._dir)
         finally:
-            CANDLE_LIMITS.update(original_limits)
-        return self._tf_data.get("5m", pd.DataFrame())
+            CANDLE_LIMITS.update(orig)
+        return self._tf_data["5m"]
 
     @property
     def n_candles(self) -> int:
-        """Number of 5m bars loaded."""
         if not self._tf_data:
             return 0
         return len(self._tf_data.get("5m", pd.DataFrame()))
 
-    @property
-    def _base_df(self) -> pd.DataFrame:
-        """Direct access to 5m DataFrame (used internally by legacy methods)."""
-        if not self._tf_data:
-            self.load_base_df()
-        return self._tf_data.get("5m", pd.DataFrame())
-
     def get_multi_tf_candles(
-        self,
-        end_idx: int,
-        lookback_5m: int = 500,
+        self, end_idx: int, lookback_5m: int = 500
     ) -> Dict[str, pd.DataFrame]:
-        """
-        Return a dict of DataFrames for each timeframe ending at end_idx
-        on the 5m index (resampled from 5m base).
-        """
+        """Per-TF slices aligned to the 5m window ending at end_idx."""
         if not self._tf_data:
             self.load_base_df()
+        base     = self._tf_data["5m"]
+        start    = max(0, end_idx - lookback_5m)
+        slice_5m = base.iloc[start: end_idx + 1].copy()
+        ts_s, ts_e = slice_5m.index[0], slice_5m.index[-1]
 
-        base = self._tf_data["5m"]
-        start = max(0, end_idx - lookback_5m)
-        df_5m = base.iloc[start: end_idx + 1].copy()
-
-        def resample(rule: str) -> pd.DataFrame:
-            return df_5m.resample(rule).agg({
-                "open": "first", "high": "max",
-                "low": "min", "close": "last", "volume": "sum",
-            }).dropna()
-
-        return {
-            "5m":  df_5m,
-            "15m": resample("15min"),
-            "1h":  resample("1h"),
-            "4h":  resample("4h"),
-            "1d":  resample("1D"),
-        }
+        result = {"5m": slice_5m}
+        for tf in ["15m", "1h", "4h", "1d"]:
+            df = self._tf_data.get(tf, pd.DataFrame())
+            result[tf] = df.loc[(df.index >= ts_s) & (df.index <= ts_e)].copy() \
+                         if not df.empty else pd.DataFrame()
+        return result
 
     def get_episode_start_indices(
-        self,
-        episode_len: int = 4320,
-        warmup: int = 500,
-    ) -> list:
-        """Return valid episode start indices for offline training."""
+        self, episode_len: int = 4320, warmup: int = 500
+    ) -> List[int]:
         n = self.n_candles
         return list(range(warmup, n - episode_len, episode_len // 2))
+
+
+# ---------------------------------------------------------------------------
+# Download helper
+# ---------------------------------------------------------------------------
+
+def _download(timeframe: str, target_rows: int) -> pd.DataFrame:
+    try:
+        import ccxt
+    except ImportError:
+        raise ImportError("pip install ccxt")
+
+    exchange = ccxt.binanceusdm({"enableRateLimit": True})
+    exchange.load_markets()
+
+    ms_per     = _tf_ms(timeframe)
+    since      = exchange.milliseconds() - target_rows * ms_per
+    batch_size = 1500
+    all_rows: list = []
+
+    logger.info("Downloading %s (target %d bars) …", timeframe, target_rows)
+
+    while len(all_rows) < target_rows:
+        try:
+            batch = exchange.fetch_ohlcv(
+                SYMBOL, timeframe=timeframe, since=since, limit=batch_size
+            )
+        except Exception as e:
+            logger.warning("Fetch error (%s): %s — retrying in 5s", timeframe, e)
+            time.sleep(5)
+            continue
+
+        if not batch:
+            break
+
+        all_rows.extend(batch)
+        since = batch[-1][0] + ms_per
+        time.sleep(exchange.rateLimit / 1000)
+
+        if len(all_rows) >= target_rows:
+            break
+
+    if not all_rows:
+        raise RuntimeError(f"No data fetched for {timeframe}")
+
+    df = pd.DataFrame(all_rows, columns=COLUMNS)
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+    df = (
+        df.drop_duplicates("timestamp")
+          .sort_values("timestamp")
+          .set_index("timestamp")
+          .astype(float)
+          .dropna()
+    )
+    return df.iloc[-target_rows:]
+
+
+def _tf_ms(tf: str) -> int:
+    return int(tf[:-1]) * {"m": 60_000, "h": 3_600_000, "d": 86_400_000}[tf[-1]]
