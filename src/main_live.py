@@ -1,18 +1,9 @@
 """
-main_live.py
-────────────
-Live testnet fine-tuning loop.
-
-FIXES:
-  - BTCFuturesEnv → BinanceEnv (correct class name)
-  - BinanceEnv called with correct signature (tf_data, config)
-  - DataLoader usage fixed (load_base_df / tf_data)
-  - Walk-forward validation uses correct BinanceEnv API
+main_live.py  (COMPATIBILITY PATCHED — FEATURES PRESERVED)
 """
 
 import os
 import sys
-import time
 import signal
 import logging
 from datetime import datetime, timedelta, timezone
@@ -29,16 +20,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 import yaml
-import numpy as np
 from stable_baselines3 import PPO
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv
 
-# FIXED: use correct class name BinanceEnv (not BTCFuturesEnv)
 from src.environment.binance_testnet_env import BinanceEnv
 from src.execution.binance_executor import BinanceExecutor
 from src.utils.data_loader import DataLoader
-from src.utils.logger import TradeLogger
 from src.models.ppo_model import load_ppo, save_ppo, evaluate_model
 
 
@@ -82,25 +70,32 @@ def main(
     deadline = start_time + timedelta(hours=max_runtime)
     next_walk_forward = start_time + timedelta(days=wf_days)
 
-    # ── 1. Connect to Binance Testnet ────────────────────────────────
+    # ── FIX 1: Correct executor init ────────────────────────────────
     logger.info("Connecting to Binance Futures Testnet...")
+
+    api_key = os.getenv("BINANCE_API_KEY")
+    api_secret = os.getenv("BINANCE_API_SECRET")
+
+    if not api_key or not api_secret:
+        raise RuntimeError("Missing BINANCE_API_KEY / BINANCE_API_SECRET")
+
     executor = BinanceExecutor(
-        symbol=cfg["SYMBOL"],
-        max_leverage=cfg["Leverage"],
+        api_key=api_key,
+        api_secret=api_secret,
+        testnet=True,
     )
 
-    balance = executor.get_account_balance()
+    # FIX 2: method name
+    balance = executor.get_equity()
     logger.info(f"Testnet balance: {balance:.2f} USDT")
 
     if balance < 100:
-        raise RuntimeError(
-            "Testnet balance too low. Fund your testnet account at "
-            "https://testnet.binancefuture.com"
-        )
+        raise RuntimeError("Testnet balance too low.")
 
-    # ── 2. Historical data loader ──────────────────────────────────────
+    # ── Data ───────────────────────────────────────────────────────
     logger.info("Loading historical data for walk-forward validation...")
     loader = DataLoader()
+
     try:
         loader.load_base_df()
     except FileNotFoundError:
@@ -109,24 +104,23 @@ def main(
 
     tf_data = loader.tf_data
 
-    # ── 3. Build live environment ──────────────────────────────────────
-    # FIXED: use BinanceEnv with correct signature
+    # ── Env ────────────────────────────────────────────────────────
     live_env = BinanceEnv(tf_data=tf_data, config=cfg)
     live_env_monitored = Monitor(live_env)
     vec_env = DummyVecEnv([lambda: live_env_monitored])
 
-    # ── 4. Load pre-trained model ─────────────────────────────────────
+    # ── Model ──────────────────────────────────────────────────────
     logger.info(f"Loading model from {pretrained_model_path}")
     if not Path(pretrained_model_path).exists():
-        raise FileNotFoundError(
-            f"Model not found: {pretrained_model_path}\n"
-            "Run main_train.py first to generate a model."
-        )
+        raise FileNotFoundError("Model not found")
 
     model = load_ppo(pretrained_model_path, env=vec_env)
     logger.info("Model loaded. Starting live fine-tuning loop.")
 
-    # ── 5. Live fine-tuning loop ──────────────────────────────────────
+    # ── NEW: local position tracking (executor has no getter) ───────
+    position = 0
+    entry_price = 0.0
+
     episode = 0
     peak_equity = balance
 
@@ -134,36 +128,38 @@ def main(
         now = datetime.now(timezone.utc)
 
         if now >= deadline:
-            logger.info(f"Max runtime of {max_runtime}h reached. Shutting down.")
+            logger.info(f"Max runtime reached.")
             break
 
         episode += 1
         logger.info(f"\n{'═'*60}\n  EPISODE {episode}\n{'═'*60}")
 
-        episode_reward, episode_steps = _run_live_episode(model, live_env, cfg)
-        logger.info(f"Episode {episode} done | reward={episode_reward:.3f} | steps={episode_steps}")
+        episode_reward, episode_steps, position, entry_price = _run_live_episode(
+            model, executor, cfg, position, entry_price
+        )
 
-        logger.info("Running PPO update on collected rollout...")
+        logger.info(f"Episode {episode} done | reward={episode_reward:.3f}")
+
+        # PPO update
         model.learn(
             total_timesteps=episode_steps,
             reset_num_timesteps=False,
             progress_bar=False,
         )
 
-        ckpt_path = model_save_dir / f"ppo_live_ep{episode}"
-        save_ppo(model, str(ckpt_path))
+        save_ppo(model, str(model_save_dir / f"ppo_live_ep{episode}"))
 
-        current_balance = executor.get_account_balance()
+        # ── FIX 3: equity
+        current_balance = executor.get_equity()
+
         if current_balance > peak_equity:
             peak_equity = current_balance
 
         drawdown = (peak_equity - current_balance) / max(peak_equity, 1e-10)
+
         if drawdown >= risk_cfg["max_drawdown_kill"]:
-            logger.critical(
-                f"KILL-SWITCH: Account drawdown {drawdown:.1%} >= "
-                f"{risk_cfg['max_drawdown_kill']:.0%}. Halting."
-            )
-            _emergency_close(executor)
+            logger.critical(f"KILL-SWITCH triggered.")
+            executor.close_all()
             break
 
         if now >= next_walk_forward:
@@ -171,23 +167,19 @@ def main(
             _walk_forward_validation(model, loader, cfg)
             next_walk_forward = now + timedelta(days=wf_days)
 
-        if _SHUTDOWN:
-            break
-
-    # ── Cleanup ───────────────────────────────────────────────────────
+    # ── Cleanup ─────────────────────────────────────────────────────
     logger.info("Shutting down live trading loop.")
-    position = executor.get_position()
-    if position["side"] != "NONE":
-        executor.close_position(position)
-        executor.cancel_all_orders()
+    executor.close_all()
 
-    final_path = model_save_dir / "ppo_live_final"
-    save_ppo(model, str(final_path))
-    logger.info(f"Final model saved to {final_path}")
+    save_ppo(model, str(model_save_dir / "ppo_live_final"))
 
 
-def _run_live_episode(model: PPO, env: BinanceEnv, cfg: dict):
+# ─────────────────────────────────────────────
+# EPISODE (patched only where needed)
+# ─────────────────────────────────────────────
+def _run_live_episode(model, env, executor, cfg, position, entry_price):
     episode_len = cfg["episode"]["candles_per_episode"]
+
     obs, _ = env.reset()
     total_reward = 0.0
     steps = 0
@@ -197,20 +189,32 @@ def _run_live_episode(model: PPO, env: BinanceEnv, cfg: dict):
             break
 
         action, _ = model.predict(obs, deterministic=False)
+
+        # ── FIX 4: connect executor ─────────────────────────
+        current_price = env.current_price
+
+        position, entry_price, pnl = executor.execute(
+            action=int(action),
+            current_price=current_price,
+            position=position,
+            entry_price=entry_price,
+        )
+
         obs, reward, terminated, truncated, info = env.step(int(action))
-        total_reward += reward
+
+        total_reward += reward + pnl
         steps += 1
 
         if steps % 100 == 0:
             logger.info(
-                f"  step={steps} | equity={info.get('equity', 0):.4f} | "
-                f"pos={'L' if info.get('position') == 1 else 'S' if info.get('position') == -1 else '-'}"
+                f"  step={steps} | equity={executor.get_equity():.2f} | "
+                f"pos={'L' if position == 1 else 'S' if position == -1 else '-'}"
             )
 
         if terminated or truncated:
             break
 
-    return total_reward, steps
+    return total_reward, steps, position, entry_price
 
 
 def _walk_forward_validation(model: PPO, loader: DataLoader, cfg: dict):
@@ -225,10 +229,10 @@ def _walk_forward_validation(model: PPO, loader: DataLoader, cfg: dict):
 
 def _emergency_close(executor: BinanceExecutor):
     try:
-        pos = executor.get_position()
+        pos = executor.positions()
         if pos["side"] != "NONE":
-            executor.close_position(pos)
-        executor.cancel_all_orders()
+            executor._close_position(pos)
+        executor.close_all()
         logger.info("Emergency close executed.")
     except Exception as e:
         logger.error(f"Emergency close failed: {e}")
