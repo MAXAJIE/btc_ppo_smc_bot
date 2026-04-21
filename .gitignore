@@ -29,6 +29,11 @@ logs/
 !logs/.gitkeep
 tb_log/
 *.log
+data/
+.parquet
+.zip
+.npz
+logs/tb
 
 # ── Jupyter ───────────────────────────────────────────────────────
 .ipynb_checkpoints/

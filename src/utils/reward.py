@@ -24,9 +24,9 @@ import numpy as np
 # ---------------------------------------------------------------------------
 # Tuneable constants
 # ---------------------------------------------------------------------------
-WIN_SCALE    = 1.0
+WIN_SCALE    = 1.01
 LOSS_SCALE   = 1.3
-HOLD_PENALTY = 0.0001
+HOLD_PENALTY = 0.00005
 
 INTRA_WIN_SCALE  = 0.03
 INTRA_LOSS_SCALE = 0.04
@@ -45,7 +45,7 @@ FUNDING_RATE    = 0.0001
 FUNDING_STEPS   = 480
 
 SL_EXTRA_PENALTY    = -1.5
-HOLDING_COST_PER_BAR = -0.00005
+HOLDING_COST_PER_BAR = -0.0001
 KILLSWITCH_SCALE     = 50.0
 
 
@@ -185,50 +185,43 @@ def compute_step_reward(
     bear_ob_dist: float = 0.0,
     snr_support_1: float = 0.0,
     snr_resist_1: float = 0.0,
+**kwargs
 ) -> float:
-    """
-    Unified per-step reward function.
-
-    Supports both the test-style flat kwargs and the legacy env-style kwargs.
-    """
-    # Handle legacy aliases
-    if new_position is None:
-        new_position = position
-    if realised_pnl_pct is not None:
-        realized_pnl_pct = realised_pnl_pct
+    # 别名处理
+    if kwargs.get('realised_pnl_pct') is not None:
+        realized_pnl_pct = kwargs['realised_pnl_pct']
         trade_closed = abs(realized_pnl_pct) > 1e-9
-    if unrealised_pct is not None:
-        unrealized_pnl_pct = unrealised_pct
+    if kwargs.get('unrealised_pct') is not None:
+        unrealized_pnl_pct = kwargs['unrealised_pct']
 
     reward = 0.0
 
-    # Kill-switch: catastrophic terminal penalty
+    # 1. Kill-switch (最高优先级)
     if kill_triggered:
-        reward += killswitch_penalty(current_drawdown)
-        return float(np.clip(reward, -200.0, 5.0))
+        return float(np.clip(killswitch_penalty(current_drawdown), -200.0, 5.0))
 
-    # Transaction cost (entry/exit)
-    reward += transaction_cost
-
-    # Funding fee
-    reward += funding_fee
-
-    # Per-bar holding cost
-    reward += holding_cost(bars_in_trade, position)
-
-    # Trade close reward
+    # 2. 分情况讨论：平仓 vs 持仓 vs 空仓
     if trade_closed:
+        # 平仓瞬间：只计入交易收益和止损罚金，不计入时间惩罚
         reward += trade_reward(realized_pnl_pct)
+        reward += transaction_cost
         if sl_hit:
             reward += sl_hit_extra_penalty()
-    else:
-        # Intra-trade: use unrealized PnL as shaping
+    elif position != 0:
+        # 正在持仓：PnL 波动 + 持仓成本 + 资金费
         reward += step_reward(unrealized_pnl_pct, position, bars_in_trade)
+        reward += holding_cost(bars_in_trade, position)
+        reward += funding_fee
+    else:
+        # 纯空仓：只扣除空仓惩罚
+        reward -= HOLD_PENALTY
 
-    # Drawdown penalty (every step)
+    # 3. 回撤惩罚 (始终存在)
     reward += drawdown_penalty(current_drawdown)
 
     return float(np.clip(reward, -200.0, 5.0))
+
+
 
 
 # ---------------------------------------------------------------------------

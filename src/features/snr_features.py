@@ -43,6 +43,8 @@ def compute_snr_features(df: pd.DataFrame, current_idx: int) -> np.ndarray:
     close = sub["close"].iloc[-1]
 
     supports, resistances = _pivot_levels(sub, SWING_N)
+    if not supports and not resistances:
+        return np.zeros(6, dtype=np.float32)
 
     # Pick nearest MAX_LEVELS levels on each side
     s_below = sorted([s for s in supports    if s <= close], reverse=True)[:MAX_LEVELS]

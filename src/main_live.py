@@ -36,7 +36,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv
 
 # FIXED: use correct class name BinanceEnv (not BTCFuturesEnv)
 from src.environment.binance_testnet_env import BinanceEnv
-from src.execution.binance_executor import BinanceFuturesExecutor
+from src.execution.binance_executor import BinanceExecutor
 from src.utils.data_loader import DataLoader
 from src.utils.logger import TradeLogger
 from src.models.ppo_model import load_ppo, save_ppo, evaluate_model
@@ -84,9 +84,9 @@ def main(
 
     # ── 1. Connect to Binance Testnet ────────────────────────────────
     logger.info("Connecting to Binance Futures Testnet...")
-    executor = BinanceFuturesExecutor(
-        symbol=cfg["symbol"],
-        max_leverage=cfg["max_leverage"],
+    executor = BinanceExecutor(
+        symbol=cfg["SYMBOL"],
+        max_leverage=cfg["Leverage"],
     )
 
     balance = executor.get_account_balance()
@@ -223,7 +223,7 @@ def _walk_forward_validation(model: PPO, loader: DataLoader, cfg: dict):
         logger.warning(f"Walk-forward validation failed: {e}")
 
 
-def _emergency_close(executor: BinanceFuturesExecutor):
+def _emergency_close(executor: BinanceExecutor):
     try:
         pos = executor.get_position()
         if pos["side"] != "NONE":
