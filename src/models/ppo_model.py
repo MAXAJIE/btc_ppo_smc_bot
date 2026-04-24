@@ -159,9 +159,11 @@ def update_lr(model: PPO, new_lr: float) -> None:
 # Callbacks (保留原逻辑)
 # ---------------------------------------------------------------------------
 
+# --- src/models/ppo_model.py ---
+
 def make_callbacks(
         model_dir: str,
-        training_env: VecNormalize,  # 传入训练环境
+        training_env: VecNormalize,  # 函数接收的变量名可以不变
         eval_env=None,
         save_freq: int = 50_000,
 ) -> list:
@@ -169,27 +171,24 @@ def make_callbacks(
     Path(model_dir).mkdir(parents=True, exist_ok=True)
     callbacks = []
 
-    # 确保评估环境也使用相同的归一化统计
     if eval_env is not None:
-        # 如果 eval_env 还不是 VecNormalize，包装它
         from stable_baselines3.common.vec_env import VecNormalize
 
-
-        # 关键：allow_ns=True 允许在评估时不更新统计数据（只使用训练集的均值/方差）
+        # 修正：将参数名从 training_env 改为 venv
         eval_vec_env = VecNormalize(
             eval_env,
-            training_env=training_env,  # 共享统计数据！
+            venv=training_env,  # 这里是关键修正点！SB3 使用 venv 来引用源环境
             norm_obs=True,
-            norm_reward=False,  # 评估不需要归一化奖励
+            norm_reward=False,
             clip_obs=10.0
         )
-        # 禁用评估时的统计数据更新，保持一致性
+
         eval_vec_env.training = False
         eval_vec_env.norm_reward = False
 
         callbacks.append(
             EvalCallback(
-                eval_vec_env,  # 使用包装后的环境
+                eval_vec_env,
                 best_model_save_path=os.path.join(model_dir, "best"),
                 log_path=os.path.join(model_dir, "eval_logs"),
                 eval_freq=save_freq,
