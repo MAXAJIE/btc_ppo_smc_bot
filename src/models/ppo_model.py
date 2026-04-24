@@ -192,27 +192,45 @@ def make_callbacks(model_dir: str, eval_env=None, save_freq: int = 50_000) -> li
 
 
 class EpisodeStatsCallback(BaseCallback):
+    """Logs per-episode reward to TensorBoard via SB3's logger."""
+
     def __init__(self):
         super().__init__()
         self._ep_rewards: list = []
         self._ep_lengths: list = []
 
     def _on_step(self) -> bool:
-        for info in self.locals.get("infos", []):
-            if "episode" in info:
-                r = info["episode"]["r"]
-                l = info["episode"]["l"]
-                self._ep_rewards.append(r)
-                self._ep_lengths.append(l)
-                self.logger.record("episode/reward", r)
-                self.logger.record("episode/length", l)
-                if len(self._ep_rewards) % 10 == 0:
-                    logger.info(
-                        "[Ep %d] avg_rew=%.3f  avg_len=%.0f",
-                        len(self._ep_rewards),
-                        np.mean(self._ep_rewards[-10:]),
-                        np.mean(self._ep_lengths[-10:]),
-                    )
+        # 1. 安全地从 locals 获取 infos 列表
+        infos = self.locals.get("infos")
+        if infos is None:
+            return True
+
+        for info in infos:
+            # 2. 必须检查 info 是否为字典，且包含 "episode" 键
+            # SB3 的底层实现中，只有当 episode 结束时，Monitor 包装器才会插入这个键
+            if isinstance(info, dict) and "episode" in info:
+                ep_info = info["episode"]
+
+                # 3. 再次检查 ep_info 是否为字典（防止某些自定义包装器返回非标准数据）
+                if isinstance(ep_info, dict):
+                    r = ep_info.get("r", 0.0)
+                    l = ep_info.get("l", 0)
+
+                    self._ep_rewards.append(r)
+                    self._ep_lengths.append(l)
+
+                    # 写入 TensorBoard
+                    self.logger.record("episode/reward", r)
+                    self.logger.record("episode/length", l)
+
+                    # 每 10 个 Episode 打印一次均值
+                    if len(self._ep_rewards) % 10 == 0:
+                        logger.info(
+                            "[Ep %d] avg_rew=%.3f  avg_len=%.0f",
+                            len(self._ep_rewards),
+                            np.mean(self._ep_rewards[-10:]),
+                            np.mean(self._ep_lengths[-10:]),
+                        )
         return True
 
 
