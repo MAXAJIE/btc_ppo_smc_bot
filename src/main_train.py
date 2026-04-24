@@ -186,8 +186,12 @@ def main(
     )
 
     # ── 5. Callbacks ──────────────────────────────────────────────────────────
+    training_vec_normalize = model.get_vec_normalize_env()
+
+    # 2. 修改调用逻辑，确保参数名 training_env 严格对应
     callbacks = make_callbacks(
         model_dir=model_save_dir,
+        training_env=training_vec_normalize,  # 这里的键名必须叫 training_env
         eval_env=eval_vec,
         save_freq=offline_cfg.get("save_every", 50_000),
     )

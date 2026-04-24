@@ -159,31 +159,44 @@ def update_lr(model: PPO, new_lr: float) -> None:
 # Callbacks (保留原逻辑)
 # ---------------------------------------------------------------------------
 
-def make_callbacks(model_dir: str, eval_env=None, save_freq: int = 50_000) -> list:
+def make_callbacks(
+        model_dir: str,
+        training_env: VecNormalize,  # 传入训练环境
+        eval_env=None,
+        save_freq: int = 50_000,
+) -> list:
+    """Build standard SB3 callback list with synchronized VecNormalize."""
     Path(model_dir).mkdir(parents=True, exist_ok=True)
     callbacks = []
 
-    callbacks.append(
-        CheckpointCallback(
-            save_freq       = save_freq,
-            save_path       = model_dir,
-            name_prefix     = "ppo_btc",
-            save_vecnormalize = True, # 设为 True 以便恢复训练时保持归一化状态
-            verbose         = 1,
-        )
-    )
-
+    # 确保评估环境也使用相同的归一化统计
     if eval_env is not None:
+        # 如果 eval_env 还不是 VecNormalize，包装它
+        from stable_baselines3.common.vec_env import VecNormalize
+
+
+        # 关键：allow_ns=True 允许在评估时不更新统计数据（只使用训练集的均值/方差）
+        eval_vec_env = VecNormalize(
+            eval_env,
+            training_env=training_env,  # 共享统计数据！
+            norm_obs=True,
+            norm_reward=False,  # 评估不需要归一化奖励
+            clip_obs=10.0
+        )
+        # 禁用评估时的统计数据更新，保持一致性
+        eval_vec_env.training = False
+        eval_vec_env.norm_reward = False
+
         callbacks.append(
             EvalCallback(
-                eval_env,
-                best_model_save_path = os.path.join(model_dir, "best"),
-                log_path             = os.path.join(model_dir, "eval_logs"),
-                eval_freq            = save_freq,
-                n_eval_episodes      = 5,
-                deterministic        = True,
-                render               = False,
-                verbose              = 1,
+                eval_vec_env,  # 使用包装后的环境
+                best_model_save_path=os.path.join(model_dir, "best"),
+                log_path=os.path.join(model_dir, "eval_logs"),
+                eval_freq=save_freq,
+                n_eval_episodes=5,
+                deterministic=True,
+                render=False,
+                verbose=1,
             )
         )
 
