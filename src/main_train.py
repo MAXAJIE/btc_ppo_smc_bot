@@ -94,9 +94,13 @@ def _resolve_checkpoint(path: str) -> Path:
 
 def make_env(tf_data: dict, cfg: dict, seed: int = 0):
     def _init():
-        return Monitor(BinanceEnv(tf_data=tf_data, config=cfg))
+        # 1. 创建原始环境
+        env = BinanceEnv(tf_data=tf_data, config=cfg)
+        # 2. 设置种子
+        env.reset(seed=seed)
+        # 3. 必须使用 Monitor 包装，SB3 的日志系统（ep_info_buffer）依赖它
+        return Monitor(env)
     return _init
-
 
 def main(
     model_save_dir:  Optional[str]   = None,
@@ -195,6 +199,9 @@ def main(
         eval_env=eval_vec,
         save_freq=offline_cfg.get("save_every", 50_000),
     )
+
+    # 在 main_train.py 的 model.learn 之前
+    model.ep_info_buffer.clear()  # 确保没有旧的、格式错误的数据残留在缓存里
 
     # ── 6. Train ──────────────────────────────────────────────────────────────
     model.learn(
