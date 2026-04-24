@@ -11,11 +11,9 @@ import time
 import logging
 import threading
 from collections import deque
-from datetime import datetime, timezone
 from typing import Dict, Optional
 
 import pandas as pd
-import numpy as np
 
 logger = logging.getLogger(__name__)
 

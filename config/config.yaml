@@ -26,8 +26,8 @@ environment:
   action_dim:           7
   episode_steps:        5760         # 20 days — long enough to see full swing
   max_trade_hold_steps: 1440         # 5 days (288 bars/day × 5)
-  stop_loss_pct:        0.03         # 3% hard stop
-  take_profit_pct:      0.09         # 9% hard TP — gives 3% target breathing room
+  stop_loss_pct:        0.015         # 3% hard stop
+  take_profit_pct:      0.045         # 9% hard TP — gives 3% target breathing room
   kill_switch_drawdown: 0.15
   max_leverage:         3.0
 
@@ -80,7 +80,7 @@ ppo:
 reward:
   entry_tax:              0.15    # flat cost per new position
   survival_bonus:         0.001   # per-step bonus for holding
-  profit_target_pct:      0.03    # 3% threshold for exponential reward
+  profit_target_pct:      0.045    # 3% threshold for exponential reward
   win_scale_above:        1.5     # exponent: (pnl*100)^1.5 for pnl >= 3%
   win_scale_below:        10.0    # linear scale for sub-3% wins
   loss_scale:             150.0   # punishment multiplier for losses

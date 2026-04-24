@@ -97,14 +97,21 @@ def build_ppo(env, cfg: Optional[dict] = None, learning_rate: Optional[float] = 
     tb_log = offline_cfg.get("tb_log_dir", "./logs/tb")
     Path(tb_log).mkdir(parents=True, exist_ok=True)
 
+    from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+
+    # 在 build_ppo() 之前包装环境
+    vec_env = DummyVecEnv([lambda: env])
+    # 归一化观测值和奖励，这对于 PPO 寻找 3:1 RR 的稀疏奖励至关重要
+    vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=True, clip_obs=10.0)
+
     model = PPO(
         policy        = ppo_cfg.get("policy", "MlpPolicy"),
-        env           = env,
+        env           = vec_env,
         learning_rate = lr,
         n_steps       = int(ppo_cfg.get("n_steps",      4096)),
-        batch_size    = int(ppo_cfg.get("batch_size",    1024)),
+        batch_size    = int(ppo_cfg.get("batch_size",    256)),
         n_epochs      = int(ppo_cfg.get("n_epochs",      5)),
-        gamma         = float(ppo_cfg.get("gamma",       0.995)),
+        gamma         = float(ppo_cfg.get("gamma",       0.999)),
         gae_lambda    = float(ppo_cfg.get("gae_lambda",  0.97)),
         clip_range    = float(ppo_cfg.get("clip_range",  0.15)),
         ent_coef      = float(ppo_cfg.get("ent_coef",    0.01)),

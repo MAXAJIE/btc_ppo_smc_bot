@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 import random
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
 __all__ = ["BinanceEnv"]
 
@@ -228,8 +228,8 @@ class BinanceEnv(gym.Env):
         return max(0, int(arr.searchsorted(ts, side="right")) - 1)
 
     def _apply_action(self, action: int, close: float) -> None:
-        sl = self._ecfg.get("stop_loss_pct",  0.03)
-        tp = self._ecfg.get("take_profit_pct", 0.06)
+        sl = self._ecfg.get("stop_loss_pct",  0.015)
+        tp = self._ecfg.get("take_profit_pct", 0.045)
         mh = self._ecfg.get("max_trade_hold_steps", 576)
 
         # Forced close
