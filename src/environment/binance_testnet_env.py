@@ -159,12 +159,14 @@ class BinanceEnv(gym.Env):
         kill_dd = self._ecfg.get("kill_switch_drawdown", 0.15)
         done    = (self._ep_step >= self._steps) or (self._equity < 1.0 - kill_dd)
 
+        # src/environment/binance_testnet_env.py 第 112 行左右
         info = {
-            "equity":    self._equity,
-            "position":  self._pos,
-            "step":      self._ep_step,
-            "episode":   self._episode,
+            "equity": self._equity,
+            "position": self._pos,
+            "step": self._ep_step,
+            "env_episode_id": self._episode,  # 改个名字，比如加个前缀
         }
+
         return self._obs(), reward, done, False, info
 
     def render(self):
