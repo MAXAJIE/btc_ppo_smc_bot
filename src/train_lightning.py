@@ -95,16 +95,37 @@ def main():
 
     from src.main_train import main as train_main
 
-    final_path = train_main(
-        model_save_dir=MODEL_DIR,
-        data_dir=DATA_DIR,
-        total_timesteps=args.timesteps,
-        n_envs=n_envs,
-        pretrained_path=resume_path,
-        learning_rate=args.lr,
-    )
+    # 关键点 1: 获取返回的 final_path
+    final_path = None
+    try:
+        final_path = train_main(
+            model_save_dir=MODEL_DIR,
+            data_dir=DATA_DIR,
+            total_timesteps=args.timesteps,
+            n_envs=n_envs,
+            pretrained_path=resume_path,
+            learning_rate=args.lr,
+        )
 
-    logger.info(f"Training complete! Final model: {final_path}")
+    except KeyboardInterrupt:
+        logger.info("Training interrupted by user.")
+    except Exception as e:
+        logger.error(f"Training crashed: {e}", exc_info=True)
+    finally:
+        # 关键点 2: 强制清理所有 TQDM 实例，防止退出时报错
+        try:
+            from tqdm import tqdm
+            while getattr(tqdm, "_instances", None):
+                tqdm._instances.pop().close()
+        except Exception:
+            pass
+
+    logger.info("Cleaning up processes...")
+
+    if final_path:
+        logger.info(f"Training complete! Final model: {final_path}")
+    else:
+        logger.info("Trainer exited without saving a final model path.")
 
 
 def _ensure_data(data_dir: str, years: int):
