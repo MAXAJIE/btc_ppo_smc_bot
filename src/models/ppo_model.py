@@ -3,24 +3,12 @@ ppo_model.py
 ─────────────
 Thin wrapper around Stable-Baselines3 PPO.
 
-Bugs fixed vs original
------------------------
-1. build_ppo() read cfg["ppo"]["policy_kwargs"]["activation_fn"] and
-   cfg["offline"]["tb_log_dir"] — both were missing from config.yaml.
-   Config now has these keys; build_ppo() also has safe .get() fallbacks
-   so it never crashes on a missing key.
-
-2. update_lr() used `model.lr_schedule = lambda _: new_lr`.
-   SB3 inlines the schedule into the optimiser on every update call, but
-   the plain lambda is not picklable — model.save() would crash.
-   Fixed: use stable_baselines3.common.utils.constant_fn (SB3's own
-   picklable constant schedule).
-
-3. load_ppo() required `env` as a positional argument.
-   When called during evaluation without a live env it would crash.
-   Fixed: env is now Optional[...] = None.
-
-4. Added evaluate_policy() alias (some callers use that name).
+Bugs fixed & preserved:
+1. build_ppo() config safe access (.get() fallbacks).
+2. update_lr() picklable constant_fn (fixes save crash).
+3. load_ppo() Optional env support.
+4. evaluate_policy() alias.
+5. NEW: Fixed SubprocVecEnv nesting ValueError.
 """
 
 import os
@@ -30,13 +18,14 @@ from typing import Optional
 
 import torch
 import numpy as np
+import yaml
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import (
     BaseCallback,
     CheckpointCallback,
     EvalCallback,
 )
-import yaml
+from stable_baselines3.common.vec_env import VecEnv, DummyVecEnv, VecNormalize, unwrap_vec_normalize
 
 logger = logging.getLogger(__name__)
 
@@ -54,16 +43,7 @@ def _load_cfg() -> dict:
 def build_ppo(env, cfg: Optional[dict] = None, learning_rate: Optional[float] = None) -> PPO:
     """
     Create a new PPO model with config-driven hyperparameters.
-
-    Parameters
-    ----------
-    env           : gym.Env or VecEnv
-    cfg           : full config dict; if None loads from config.yaml
-    learning_rate : override config value when provided
-
-    Returns
-    -------
-    PPO instance (not yet trained)
+    智能处理环境包装，防止 SubprocVecEnv 重复包装导致的 ValueError。
     """
     if cfg is None:
         cfg = _load_cfg()
@@ -71,39 +51,50 @@ def build_ppo(env, cfg: Optional[dict] = None, learning_rate: Optional[float] = 
     ppo_cfg     = cfg["ppo"]
     offline_cfg = cfg["offline"]
 
-    # ── policy_kwargs ────────────────────────────────────────────────────────
-    # Support both nested (cfg["ppo"]["policy_kwargs"]["activation_fn"])
-    # and flat (cfg["ppo"]["activation_fn"]) layout for backward compat.
+    # ── 1. policy_kwargs ────────────────────────────────────────────────────────
     pk_raw   = ppo_cfg.get("policy_kwargs", {})
-    act_str  = pk_raw.get("activation_fn",
-               ppo_cfg.get("activation_fn", "tanh"))
-    net_arch = pk_raw.get("net_arch",
-               ppo_cfg.get("net_arch",
-               {"pi": [256, 256, 128], "vf": [256, 256, 128]}))
+    act_str  = pk_raw.get("activation_fn", ppo_cfg.get("activation_fn", "tanh"))
+    net_arch = pk_raw.get("net_arch", ppo_cfg.get("net_arch", {"pi": [256, 256, 128], "vf": [256, 256, 128]}))
 
     act_fns = {"tanh": torch.nn.Tanh, "relu": torch.nn.ReLU, "elu": torch.nn.ELU}
     act_fn  = act_fns.get(act_str, torch.nn.Tanh)
 
     policy_kwargs = {"net_arch": net_arch, "activation_fn": act_fn}
 
-    # ── Learning rate ─────────────────────────────────────────────────────────
+    # ── 2. Learning rate ─────────────────────────────────────────────────────────
     lr = (
         learning_rate
         if learning_rate is not None
         else float(ppo_cfg.get("initial_lr", ppo_cfg.get("learning_rate", 1e-4)))
     )
 
-    # ── TensorBoard log dir ───────────────────────────────────────────────────
+    # ── 3. TensorBoard log dir ───────────────────────────────────────────────────
     tb_log = offline_cfg.get("tb_log_dir", "./logs/tb")
     Path(tb_log).mkdir(parents=True, exist_ok=True)
 
-    from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+    # ── 4. 环境包装修复 (解决 SubprocVecEnv 报错) ──────────────────────────────────
+    # 检查是否已经是向量化环境 (VecEnv)
+    if isinstance(env, VecEnv):
+        vec_env = env
+        logger.info("Using existing VecEnv (Subproc/Dummy).")
+    else:
+        # 如果是原始的 Gymnasium 环境，才进行 DummyVecEnv 包装
+        vec_env = DummyVecEnv([lambda: env])
+        logger.info("Wrapped single environment in DummyVecEnv.")
 
-    # 在 build_ppo() 之前包装环境
-    vec_env = DummyVecEnv([lambda: env])
-    # 归一化观测值和奖励，这对于 PPO 寻找 3:1 RR 的稀疏奖励至关重要
-    vec_env = VecNormalize(vec_env, norm_obs=True, norm_reward=True, clip_obs=10.0)
+    # ── 5. 归一化处理 (对 SMC 复杂奖励至关重要) ──────────────────────────────────
+    # 检查是否已经存在 VecNormalize 包装，避免双重归一化
+    if unwrap_vec_normalize(vec_env) is None:
+        vec_env = VecNormalize(
+            vec_env,
+            norm_obs=True,
+            norm_reward=True,
+            clip_obs=10.0,
+            clip_reward=float(ppo_cfg.get("reward_clip", 15.0)) # 与 reward.py 保持同步
+        )
+        logger.info("Applied VecNormalize (norm_obs=True, norm_reward=True)")
 
+    # ── 6. 实例化 PPO ──────────────────────────────────────────────────────────
     model = PPO(
         policy        = ppo_cfg.get("policy", "MlpPolicy"),
         env           = vec_env,
@@ -130,18 +121,10 @@ def build_ppo(env, cfg: Optional[dict] = None, learning_rate: Optional[float] = 
 
 
 # ---------------------------------------------------------------------------
-# Load / Save / LR update
+# Load / Save / LR update (保留所有修复逻辑)
 # ---------------------------------------------------------------------------
 
 def load_ppo(path: str, env=None) -> PPO:
-    """
-    Load a saved PPO model.
-
-    Parameters
-    ----------
-    path : str – path to .zip checkpoint (with or without extension)
-    env  : optional; attach a new env after loading
-    """
     path = str(path)
     if not path.endswith(".zip") and not Path(path).exists():
         path = path + ".zip"
@@ -152,11 +135,6 @@ def load_ppo(path: str, env=None) -> PPO:
 
 
 def save_ppo(model: PPO, path: str) -> str:
-    """
-    Save model to disk. Returns the final .zip path.
-    SB3 appends .zip automatically — we normalise the path here.
-    """
-    # Strip .zip so SB3 doesn't double-append
     save_path = str(path)
     if save_path.endswith(".zip"):
         save_path = save_path[:-4]
@@ -169,36 +147,19 @@ def save_ppo(model: PPO, path: str) -> str:
 
 
 def update_lr(model: PPO, new_lr: float) -> None:
-    """
-    Hot-swap learning rate on a loaded model (used when --resume + fine-tuning).
-
-    Fix: use constant_fn() instead of a plain lambda.
-    SB3 pickles the lr_schedule when saving — a plain `lambda _: x`
-    is NOT picklable and causes model.save() to crash.
-    constant_fn() returns SB3's own picklable callable.
-    """
     from stable_baselines3.common.utils import constant_fn
-
     model.learning_rate = new_lr
     model.lr_schedule   = constant_fn(float(new_lr))
-
-    # Also patch the optimiser directly so the change takes effect immediately
     for pg in model.policy.optimizer.param_groups:
         pg["lr"] = new_lr
-
     logger.info("Learning rate updated → %.2e", new_lr)
 
 
 # ---------------------------------------------------------------------------
-# Callbacks
+# Callbacks (保留原逻辑)
 # ---------------------------------------------------------------------------
 
-def make_callbacks(
-    model_dir:  str,
-    eval_env=None,
-    save_freq:  int = 50_000,
-) -> list:
-    """Build standard SB3 callback list for offline training."""
+def make_callbacks(model_dir: str, eval_env=None, save_freq: int = 50_000) -> list:
     Path(model_dir).mkdir(parents=True, exist_ok=True)
     callbacks = []
 
@@ -207,7 +168,7 @@ def make_callbacks(
             save_freq       = save_freq,
             save_path       = model_dir,
             name_prefix     = "ppo_btc",
-            save_vecnormalize = False,
+            save_vecnormalize = True, # 设为 True 以便恢复训练时保持归一化状态
             verbose         = 1,
         )
     )
@@ -231,8 +192,6 @@ def make_callbacks(
 
 
 class EpisodeStatsCallback(BaseCallback):
-    """Logs per-episode reward to TensorBoard via SB3's logger."""
-
     def __init__(self):
         super().__init__()
         self._ep_rewards: list = []
@@ -258,14 +217,10 @@ class EpisodeStatsCallback(BaseCallback):
 
 
 # ---------------------------------------------------------------------------
-# Evaluation
+# Evaluation (保留原逻辑)
 # ---------------------------------------------------------------------------
 
 def evaluate_model(model: PPO, env, n_episodes: int = 10) -> dict:
-    """
-    Run deterministic evaluation and return metrics dict.
-    Called by main_train.py as evaluate_model(...).
-    """
     rewards      = []
     equities     = []
     max_dds      = []
@@ -300,6 +255,4 @@ def evaluate_model(model: PPO, env, n_episodes: int = 10) -> dict:
         "n_episodes":        n_episodes,
     }
 
-
-# Alias — some callers use evaluate_policy
 evaluate_policy = evaluate_model
