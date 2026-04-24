@@ -175,15 +175,21 @@ def make_callbacks(
         from stable_baselines3.common.vec_env import VecNormalize
 
         # 修正：将参数名从 training_env 改为 venv
+        # 直接使用 sync_venv 逻辑的底层参数名
         eval_vec_env = VecNormalize(
             eval_env,
-            venv=training_env,  # 这里是关键修正点！SB3 使用 venv 来引用源环境
             norm_obs=True,
             norm_reward=False,
             clip_obs=10.0
         )
 
-        eval_vec_env.training = False
+        if training_env is not None:
+            eval_vec_env.obs_rms = training_env.obs_rms
+            eval_vec_env.training = False
+
+        # 手动同步统计数据
+        eval_vec_env.ret_rms = training_env.ret_rms
+
         eval_vec_env.norm_reward = False
 
         callbacks.append(

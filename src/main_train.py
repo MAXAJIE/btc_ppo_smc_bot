@@ -201,7 +201,9 @@ def main(
     )
 
     # 在 main_train.py 的 model.learn 之前
-    model.ep_info_buffer.clear()  # 确保没有旧的、格式错误的数据残留在缓存里
+    # 在 main_train.py 的 model.learn 之前
+    if model.ep_info_buffer is not None:
+        model.ep_info_buffer.clear()
 
     # ── 6. Train ──────────────────────────────────────────────────────────────
     model.learn(
