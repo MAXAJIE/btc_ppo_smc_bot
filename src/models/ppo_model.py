@@ -36,9 +36,6 @@ from stable_baselines3.common.callbacks import (
     CheckpointCallback,
     EvalCallback,
 )
-from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.utils import constant_fn
-from stable_baselines3.common.vec_env import DummyVecEnv
 import yaml
 
 logger = logging.getLogger(__name__)
@@ -105,7 +102,7 @@ def build_ppo(env, cfg: Optional[dict] = None, learning_rate: Optional[float] = 
         env           = env,
         learning_rate = lr,
         n_steps       = int(ppo_cfg.get("n_steps",      4096)),
-        batch_size    = int(ppo_cfg.get("batch_size",    256)),
+        batch_size    = int(ppo_cfg.get("batch_size",    1024)),
         n_epochs      = int(ppo_cfg.get("n_epochs",      5)),
         gamma         = float(ppo_cfg.get("gamma",       0.995)),
         gae_lambda    = float(ppo_cfg.get("gae_lambda",  0.97)),

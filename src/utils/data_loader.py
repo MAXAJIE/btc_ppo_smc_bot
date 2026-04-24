@@ -235,6 +235,92 @@ class DataLoader:
         n = self.n_candles
         return list(range(warmup, n - episode_len, episode_len // 2))
 
+    def update_live_data(self, client=None, lookback: int = 500) -> Dict[str, pd.DataFrame]:
+        """
+        Fetch the latest candles from Binance and return a fresh tf_data dict
+        containing the last `lookback` bars for each timeframe.
+
+        Used by main_live.py to keep the env's data current without
+        re-downloading the entire 2-year history.
+
+        Parameters
+        ----------
+        client : binance.client.Client | None
+            If provided, uses it to fetch live candles.
+            If None, re-reads from the parquet cache (useful for testing).
+        lookback : int
+            Number of recent bars to keep per TF.
+
+        Returns
+        -------
+        dict[str, pd.DataFrame]  — same structure as tf_data
+        """
+        if client is not None:
+            try:
+                return self._fetch_recent_from_exchange(client, lookback)
+            except Exception as e:
+                logger.warning("Live fetch failed (%s) — using cached data.", e)
+
+        # Fallback: reload from cache and slice the tail
+        if not self._tf_data:
+            try:
+                self.load_base_df()
+            except FileNotFoundError:
+                logger.warning("No cache available for update_live_data.")
+                return self._tf_data
+
+        result = {}
+        for tf, df in self._tf_data.items():
+            result[tf] = df.iloc[-lookback:].copy() if len(df) > lookback else df.copy()
+        return result
+
+    def _fetch_recent_from_exchange(
+        self, client, lookback: int
+    ) -> Dict[str, pd.DataFrame]:
+        """Fetch the last `lookback` candles for each TF using python-binance."""
+        import pandas as pd
+        from datetime import datetime, timezone
+
+        result = {}
+        tf_map = {
+            "5m":  client.KLINE_INTERVAL_5MINUTE,
+            "15m": client.KLINE_INTERVAL_15MINUTE,
+            "1h":  client.KLINE_INTERVAL_1HOUR,
+            "4h":  client.KLINE_INTERVAL_4HOUR,
+            "1d":  client.KLINE_INTERVAL_1DAY,
+        }
+        for tf_key, interval in tf_map.items():
+            try:
+                raw = client.futures_klines(
+                    symbol="BTCUSDT",
+                    interval=interval,
+                    limit=min(lookback, 1500),
+                )
+                rows = []
+                for k in raw:
+                    rows.append({
+                        "timestamp": pd.Timestamp(k[0], unit="ms", tz="UTC"),
+                        "open":   float(k[1]),
+                        "high":   float(k[2]),
+                        "low":    float(k[3]),
+                        "close":  float(k[4]),
+                        "volume": float(k[5]),
+                    })
+                df = (
+                    pd.DataFrame(rows)
+                      .set_index("timestamp")
+                      .sort_index()
+                      .drop_duplicates()
+                )
+                result[tf_key] = df
+                logger.debug("Fetched %d live bars for %s", len(df), tf_key)
+            except Exception as e:
+                logger.warning("Failed to fetch live %s: %s — using cache.", tf_key, e)
+                if self._tf_data and tf_key in self._tf_data:
+                    result[tf_key] = self._tf_data[tf_key].iloc[-lookback:].copy()
+
+        return result
+
 
 # ---------------------------------------------------------------------------
 # Download helper

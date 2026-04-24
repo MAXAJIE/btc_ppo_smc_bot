@@ -1,23 +1,43 @@
-# config/config.yaml — Full unified config
+# config/config.yaml — Swing-trading tuned config
+# =================================================
+# Key changes from scalping config
+# ----------------------------------
+# environment:
+#   take_profit_pct  0.06 → 0.09   give 3% target room to breathe
+#   max_trade_hold_steps 576 → 1440  5 days of 5m bars (was 2 days)
+#
+# ppo:
+#   learning_rate  0.0001 → 0.00003  finer gradient for slow swing patterns
+#   gamma          0.995  → 0.999    model considers 1000 steps ahead (critical)
+#   ent_coef       0.01   → 0.05     force exploration of "hold" action
+#   clip_range     0.15   → 0.10     more conservative policy updates
+#   finetune_epochs 3 → 2            even fewer epochs during live fine-tune
+#
+# reward:  (all driven by code constants in reward.py — listed here for reference)
+#   entry_tax           0.15         flat penalty per new trade
+#   profit_target_pct   0.03         3% threshold for "real win"
+#   intra_win_scale     0.002        near-zero: no early-close incentive
+#   entry_quality_bonus 0.20         only enter near OB/S&R
 
 environment:
-  symbol:        "BTCUSDT"
-  timeframes:    ["5m", "15m", "1h", "4h", "1d"]
-  obs_dim:       90
-  action_dim:    7
-  episode_steps: 4320         # 15 days × 288 bars/day
-  max_trade_hold_steps: 576   # 2 days max hold
-  stop_loss_pct:  0.03        # hard stop -3%
-  take_profit_pct: 0.06       # hard TP +6%
-  kill_switch_drawdown: 0.15  # halt at -15%
-  max_leverage:  3.0
+  symbol:               "BTCUSDT"
+  timeframes:           ["5m", "15m", "1h", "4h", "1d"]
+  obs_dim:              90
+  action_dim:           7
+  episode_steps:        5760         # 20 days — long enough to see full swing
+  max_trade_hold_steps: 1440         # 5 days (288 bars/day × 5)
+  stop_loss_pct:        0.03         # 3% hard stop
+  take_profit_pct:      0.09         # 9% hard TP — gives 3% target breathing room
+  kill_switch_drawdown: 0.15
+  max_leverage:         3.0
 
 offline:
-  total_timesteps: 3_000_000
-  historical_years: 2
-  save_every: 50_000
-  eval_episodes: 10
-  tb_log_dir: "./logs/tb"
+  total_timesteps:   3000000
+  historical_years:  2
+  save_every:        50000
+  eval_episodes:     10
+  tb_log_dir:        "./logs/tb"
+  fine_tune_lr:      0.00003         # matches ppo.learning_rate
 
 live:
   max_runtime_hours: 24.0
@@ -27,40 +47,47 @@ risk:
   max_drawdown_kill: 0.15
 
 episode:
-  candles_per_episode: 4320
+  candles_per_episode: 5760
 
-symbol: "BTCUSDT"
+symbol:       "BTCUSDT"
 max_leverage: 3
 
 ppo:
-  learning_rate:  0.0001
-  initial_lr:     0.0003
-  fine_tune_lr:   0.0001
-  n_steps:        4096
-  batch_size:     256
-  n_epochs:       5
-  clip_range:     0.15
-  gamma:          0.995
-  gae_lambda:     0.97
-  ent_coef:       0.01
-  vf_coef:        0.7
-  max_grad_norm:  0.5
-  policy:         "MlpPolicy"
+  policy:          "MlpPolicy"
+  learning_rate:   0.00003    # ↓ from 0.0001 — swing patterns need finer updates
+  initial_lr:      0.00003
+  fine_tune_lr:    0.00001    # even finer for live fine-tuning
+  finetune_epochs: 2          # fewer epochs to avoid overfit on short live data
+  n_steps:         4096
+  batch_size:      256
+  n_epochs:        5
+  clip_range:      0.10       # ↓ from 0.15 — more conservative policy updates
+  gamma:           0.999      # ↑ from 0.995 — CRITICAL: sees 1000 steps ahead
+  gae_lambda:      0.98       # ↑ from 0.97 — more Monte-Carlo for long episodes
+  ent_coef:        0.05       # ↑ from 0.01 — forces exploration of HOLD action
+  vf_coef:         0.7
+  max_grad_norm:   0.5
+  total_timesteps: 3000000
+  checkpoint_freq: 50000
   policy_kwargs:
     net_arch:
       pi: [256, 256, 128]
       vf: [256, 256, 128]
-    activation_fn: "tanh"
-  total_timesteps: 3_000_000
-  checkpoint_freq: 50_000
+    activation_fn: "elu"
 
+# reward section is informational only — actual values are constants in reward.py
+# change them there; this section is for documentation / dashboard display
 reward:
-  win_scale:              1.0
-  loss_scale:             1.3
-  hold_penalty:           0.0001
-  intra_win_scale:        0.03
-  intra_loss_scale:       0.04
-  entry_quality_bonus:    0.08
+  entry_tax:              0.15    # flat cost per new position
+  survival_bonus:         0.001   # per-step bonus for holding
+  profit_target_pct:      0.03    # 3% threshold for exponential reward
+  win_scale_above:        1.5     # exponent: (pnl*100)^1.5 for pnl >= 3%
+  win_scale_below:        10.0    # linear scale for sub-3% wins
+  loss_scale:             150.0   # punishment multiplier for losses
+  intra_win_scale:        0.002   # near-zero float reward
+  intra_loss_scale:       0.005   # near-zero float penalty
+  hold_penalty:           0.00001 # tiny flat-position cost
+  entry_quality_bonus:    0.20    # partial entry-tax refund near OB/S&R
   entry_quality_thresh:   0.5
   drawdown_threshold:     0.05
   drawdown_linear_k:      0.20
@@ -69,12 +96,12 @@ reward:
 garch:
   p: 1
   q: 1
-  min_fit_len: 500
+  min_fit_len: 200
   kelly_fraction: 0.25
 
 data:
   hist_years: 2
-  cache_dir: "./data"
+  cache_dir:  "./data"
 
 logging:
   log_dir:   "./logs"

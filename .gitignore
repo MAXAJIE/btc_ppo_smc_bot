@@ -34,6 +34,9 @@ data/
 .zip
 .npz
 logs/tb
+logs
+models
+
 
 # ── Jupyter ───────────────────────────────────────────────────────
 .ipynb_checkpoints/
