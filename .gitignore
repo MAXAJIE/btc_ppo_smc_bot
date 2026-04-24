@@ -36,6 +36,12 @@ data/
 logs/tb
 logs
 models
+# 忽略所有日志文件
+logs/*.csv
+logs/*.log
+
+models/*.zip
+models/validated_best/
 
 
 # ── Jupyter ───────────────────────────────────────────────────────
